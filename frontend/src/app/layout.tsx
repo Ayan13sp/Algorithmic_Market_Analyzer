@@ -11,9 +11,10 @@ const inter = Inter({
 export const metadata: Metadata = {
   title: "Algorithmic Market Analyzer | ML-Powered Trade Classifier",
   description:
-    "A quantitative analysis dashboard that uses Random Forest classification " +
-    "on engineered statistical indicators (SMA, EMA, RSI, Bollinger Bands) " +
-    "to generate buy/sell signals for Indian equities.",
+    "A quantitative analysis dashboard that trains and compares Random Forest, " +
+    "Logistic Regression and SVM classifiers on engineered technical indicators " +
+    "(SMA, EMA, RSI, MACD, Bollinger Bands) to generate next-day buy/sell signals " +
+    "for Indian equities.",
   keywords: [
     "algorithmic trading",
     "machine learning",

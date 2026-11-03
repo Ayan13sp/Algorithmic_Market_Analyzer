@@ -7,13 +7,11 @@ services:
     buildCommand: "pip install -r backend/requirements.txt"
     startCommand: "cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
     envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: banking-db
-          property: connectionString
-      - key: EXTRA_CORS_ORIGINS
-        value: "https://banking-frontend.onrender.com"
-        # In Render dashboard, you can update this to the actual frontend URL later if needed.
+      # Set these in the Render dashboard (values are not stored in this file).
+      - key: DATABASE_URL        # Neon (or any Postgres) connection string
+        sync: false
+      - key: EXTRA_CORS_ORIGINS  # URL of the deployed frontend
+        sync: false
 
   - type: web
     name: banking-frontend
@@ -23,13 +21,7 @@ services:
     buildCommand: "cd frontend && npm install && npm run build"
     startCommand: "cd frontend && npm start"
     envVars:
+      # Set in the Render dashboard to the deployed backend URL, then redeploy
+      # (Next.js bakes NEXT_PUBLIC_* values in at build time).
       - key: NEXT_PUBLIC_API_URL
-        value: "https://banking-backend.onrender.com"
-        # Update this to your actual Render backend URL
-
-databases:
-  - name: banking-db
-    databaseName: market_analyzer
-    user: market_user
-    plan: free
-    region: singapore
+        sync: false

@@ -100,8 +100,6 @@ export default function BacktestResults({ backtest }: BacktestResultsProps) {
   const formatCurrency = (val: number) =>
     `₹${val.toLocaleString("en-IN", { minimumFractionDigits: 0 })}`;
 
-  const mlWins = backtest.ml_return_pct > backtest.bh_return_pct;
-
   return (
     <div className="glass-card overflow-hidden">
       <div className="border-b border-white/5 px-5 py-3">

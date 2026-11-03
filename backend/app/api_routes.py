@@ -153,9 +153,9 @@ def get_predictions(ticker: str, db: Session = Depends(get_db)):
 @router.get("/sql-analytics/{ticker}")
 def get_sql_analytics(ticker: str, db: Session = Depends(get_db)):
     """
-    Demonstrates the complex SQL window functions used in this project
-    to compute moving averages and rolling aggregations directly in the database,
-    as mentioned in the resume.
+    Computes 14- and 50-day moving averages directly in the database with SQL
+    window functions (AVG ... OVER), as a cross-check against the pandas-computed
+    indicators stored by the analysis pipeline.
     """
     query = text(
         "SELECT "

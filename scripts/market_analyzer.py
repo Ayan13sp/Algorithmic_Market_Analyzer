@@ -1,15 +1,19 @@
 """
 Algorithmic Market Analyzer & Trade Classifier
 ================================================
-A portfolio-grade quantitative analysis pipeline that:
+Standalone version of the analysis pipeline (the web app in ../backend is the
+service-layer refactor of this script). It:
   1. Acquires & preprocesses 5 years of daily OHLCV data for a liquid Indian equity.
   2. Engineers statistical features (SMA, EMA, RSI, Bollinger Bands) and a binary
-     buy/sell target.
-  3. Trains a Random Forest classifier using a time-series-safe split and reports
-     standard classification metrics plus feature importances.
+     next-day up/down target.
+  3. Trains and tunes classifiers (Random Forest, Logistic Regression, SVM) using a
+     time-ordered split and reports standard classification metrics plus feature
+     importances.
   4. Backtests the ML strategy against a Buy-and-Hold benchmark and computes the
      annualised Sharpe Ratio.
 
+Usage  : pip install -r scripts/requirements.txt && python scripts/market_analyzer.py
+Output : docs/market_analyzer_dashboard.png
 Author : Ayan Sarkar
 Stack  : pandas · numpy · yfinance · scikit-learn · matplotlib
 """
@@ -17,6 +21,7 @@ Stack  : pandas · numpy · yfinance · scikit-learn · matplotlib
 # ---------------------------------------------------------------------------
 # Imports
 # ---------------------------------------------------------------------------
+import os
 import warnings
 from datetime import datetime, timedelta
 
@@ -434,7 +439,7 @@ def backtest(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# VISUALISATION (bonus – useful for portfolio presentation)
+# VISUALISATION
 # ═══════════════════════════════════════════════════════════════════════════
 
 def plot_results(
@@ -445,7 +450,7 @@ def plot_results(
     """Generate a 2×2 dashboard summarising the analysis."""
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     # Determine a title string (use the first ticker or a generic name)
-    ticker_title = test["Ticker"].iloc[0] if "Ticker" in test.columns else "Portfolio"
+    ticker_title = test["Ticker"].iloc[0] if "Ticker" in test.columns else "Market Analysis"
     fig.suptitle(
         f"Algorithmic Market Analyzer – {ticker_title}",
         fontsize=16,
@@ -500,7 +505,9 @@ def plot_results(
     ax4.grid(alpha=0.3, axis="x")
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])
-    output_path = "market_analyzer_dashboard.png"
+    docs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs")
+    os.makedirs(docs_dir, exist_ok=True)
+    output_path = os.path.normpath(os.path.join(docs_dir, "market_analyzer_dashboard.png"))
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     print(f"\n[Visual]   Dashboard saved → {output_path}")
     plt.show()
