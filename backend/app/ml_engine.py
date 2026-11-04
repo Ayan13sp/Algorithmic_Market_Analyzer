@@ -26,6 +26,7 @@ import yfinance as yf
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.metrics import accuracy_score, precision_score, recall_score
@@ -139,12 +140,16 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["volume_ratio"] = df["volume"] / vol_sma_20
     df["volume_change"] = df["volume"].pct_change()
 
-    # Target: 1 (Buy) if tomorrow's close > today's, else 0 (Sell/Hold).
-    df["target"] = (close.shift(-1) > close).astype(int)
+    # Target: 1 (Buy) if tomorrow's intraday return is positive, else 0.
+    # This aligns the target with what the backtest actually captures:
+    # buy at next-day Open, sell at next-day Close.
+    # Prediction is made after day T's close → trade executed on day T+1.
+    df["target"] = (close.shift(-1) > df["open_price"].shift(-1)).astype(int)
 
     # Replace infinite values (caused by divide by zero in volume ratio or RSI) with NaN
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
+
     return df
 
 
@@ -230,7 +235,166 @@ def fetch_and_store(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PHASE 3 — MODEL TRAINING & PREDICTION
+# STAGE 1 — MODEL REGISTRY, VALIDATION & DATA PREPARATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def validate_training_data(df: pd.DataFrame) -> None:
+    """
+    Fail-fast validation of a DataFrame before model training.
+
+    Checks:
+        1. DataFrame is not empty.
+        2. All 16 FEATURE_COLS are present.
+        3. The 'target' column exists.
+        4. No NaN or infinite values in features + target.
+        5. Target values are binary (0 or 1).
+        6. Minimum row count for meaningful training (≥ 50).
+
+    Raises:
+        ValueError: With a descriptive message if any check fails.
+    """
+    if df.empty:
+        raise ValueError("Training DataFrame is empty — no rows to train on.")
+
+    missing_features = [c for c in FEATURE_COLS if c not in df.columns]
+    if missing_features:
+        raise ValueError(
+            f"Missing {len(missing_features)} feature column(s): {missing_features}"
+        )
+
+    if "target" not in df.columns:
+        raise ValueError("Missing 'target' column in DataFrame.")
+
+    check_cols = FEATURE_COLS + ["target"]
+    nan_counts = df[check_cols].isna().sum()
+    cols_with_nans = nan_counts[nan_counts > 0]
+    if not cols_with_nans.empty:
+        raise ValueError(
+            f"NaN values found in {len(cols_with_nans)} column(s): "
+            f"{dict(cols_with_nans)}"
+        )
+
+    # Check for ±inf in numeric feature columns.
+    inf_mask = np.isinf(df[FEATURE_COLS].select_dtypes(include=[np.number]))
+    cols_with_infs = inf_mask.any()
+    cols_with_infs = cols_with_infs[cols_with_infs].index.tolist()
+    if cols_with_infs:
+        raise ValueError(
+            f"Infinite values found in column(s): {cols_with_infs}"
+        )
+
+    unique_targets = set(df["target"].unique())
+    if not unique_targets.issubset({0, 1}):
+        raise ValueError(
+            f"Target column must be binary (0/1), found values: {unique_targets}"
+        )
+
+    MIN_ROWS = 50
+    if len(df) < MIN_ROWS:
+        raise ValueError(
+            f"Need at least {MIN_ROWS} rows for training, got {len(df)}."
+        )
+
+
+def prepare_train_test_split(
+    df: pd.DataFrame,
+    train_ratio: float = 0.80,
+) -> Dict[str, Any]:
+    """
+    Prepare chronological train/test split with defensive data cleaning.
+
+    Steps:
+        1. Verify the index is monotonically increasing (chronological order).
+        2. Replace any residual ±inf with NaN, then drop affected rows.
+        3. Split at ``train_ratio`` boundary.
+        4. Extract X (features) and y (target) arrays.
+
+    Returns:
+        Dict with keys: X_train, X_test, y_train, y_test, train_df, test_df.
+
+    Raises:
+        ValueError: If the index is not in chronological order.
+    """
+    # ── Chronological ordering guard ──────────────────────────────────────
+    if not df.index.is_monotonic_increasing:
+        raise ValueError(
+            "DataFrame index is not in chronological order. "
+            "Sort by date before calling this function to prevent "
+            "future data from leaking into the training set."
+        )
+
+    # ── Defensive NaN / inf cleanup ───────────────────────────────────────
+    clean = df.copy()
+    clean = clean.replace([np.inf, -np.inf], np.nan)
+    rows_before = len(clean)
+    clean = clean.dropna(subset=FEATURE_COLS + ["target"])
+    rows_dropped = rows_before - len(clean)
+    if rows_dropped > 0:
+        logger.warning(
+            "Dropped %d rows with NaN/inf during train/test preparation",
+            rows_dropped,
+        )
+
+    # ── Time-series split ─────────────────────────────────────────────────
+    split_idx = int(len(clean) * train_ratio)
+    train_df = clean.iloc[:split_idx].copy()
+    test_df = clean.iloc[split_idx:].copy()
+
+    X_train = train_df[FEATURE_COLS]
+    y_train = train_df["target"]
+    X_test = test_df[FEATURE_COLS]
+    y_test = test_df["target"]
+
+    logger.info(
+        "Train/test split: %d train rows, %d test rows (ratio=%.2f)",
+        len(train_df), len(test_df), train_ratio,
+    )
+
+    return {
+        "X_train": X_train,
+        "X_test": X_test,
+        "y_train": y_train,
+        "y_test": y_test,
+        "train_df": train_df,
+        "test_df": test_df,
+    }
+
+
+def build_models() -> Dict[str, Pipeline]:
+    """
+    Model registry — returns the three candidate pipelines with sensible
+    default hyperparameters.
+
+    Each pipeline encapsulates its own preprocessing (StandardScaler for
+    models that require it), so all pipelines accept identical raw feature
+    matrices.  No hyperparameter tuning is applied here; that is the
+    responsibility of the caller (e.g. ``train_and_predict`` wraps these
+    in ``RandomizedSearchCV``).
+
+    Returns:
+        Dict mapping model name → sklearn Pipeline.
+    """
+    return {
+        "Logistic Regression": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=500, random_state=42)),
+        ]),
+        "Random Forest": Pipeline([
+            ("clf", RandomForestClassifier(
+                n_estimators=100, max_depth=10, random_state=42,
+            )),
+        ]),
+        "SVM": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", SVC(
+                probability=True, kernel="rbf", random_state=42,
+            )),
+        ]),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 3 — MODEL TRAINING & PREDICTION (uses Stage 1 components)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def train_and_predict(
@@ -250,92 +414,68 @@ def train_and_predict(
         train_size, test_size, metrics, feature_importances,
         predictions, test_df, best_model_name
     """
-    # ── Time-series split (80/20) ─────────────────────────────────────────
-    split_idx = int(len(df) * 0.80)
-    train = df.iloc[:split_idx].copy()
-    test = df.iloc[split_idx:].copy()
+    # ── Validate and prepare data ─────────────────────────────────────────
+    validate_training_data(df)
+    split = prepare_train_test_split(df, train_ratio=0.80)
+    X_train, X_test = split["X_train"], split["X_test"]
+    y_train, y_test = split["y_train"], split["y_test"]
+    train, test = split["train_df"], split["test_df"]
 
-    X_train = train[FEATURE_COLS]
-    y_train = train["target"]
-    X_test = test[FEATURE_COLS]
-    y_test = test["target"]
+    # ── Build model pipelines ─────────────────────────────────────────────
+    pipelines = build_models()
 
-    # ── Scale features (needed for LR and SVM) ────────────────────────────
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    # ── Hyperparameter grids (clf__-prefixed for Pipeline compatibility) ──
+    param_grids = {
+        "Logistic Regression": {
+            "clf__C": [0.1, 1.0, 10.0],
+            "clf__penalty": ["l2"],
+        },
+        "Random Forest": {
+            "clf__n_estimators": [50, 100],
+            "clf__max_depth": [5, 10, None],
+            "clf__min_samples_split": [2, 5],
+        },
+        "SVM": {
+            "clf__C": [0.1, 1.0],
+            "clf__gamma": ["scale", "auto"],
+        },
+    }
+    n_iter_map = {
+        "Logistic Regression": 2,
+        "Random Forest": 3,
+        "SVM": 2,
+    }
 
     # ── TimeSeriesSplit for cross-validation ──────────────────────────────
     # Reduced to 3 splits to ensure fast API responses on free tier hosting
     tscv = TimeSeriesSplit(n_splits=3)
 
-    # ── 1. Random Forest — tuned with RandomizedSearchCV ─────────────────
-    rf_param_grid = {
-        "n_estimators": [50, 100],
-        "max_depth": [5, 10, None],
-        "min_samples_split": [2, 5],
-    }
-    rf_search = RandomizedSearchCV(
-        RandomForestClassifier(random_state=42),
-        rf_param_grid,
-        n_iter=3,
-        cv=tscv,
-        scoring="accuracy",
-        n_jobs=-1,
-        random_state=42,
-    )
-    rf_search.fit(X_train, y_train)
-    rf_best = rf_search.best_estimator_
-
-    # ── 2. Logistic Regression — tuned with RandomizedSearchCV ───────────
-    lr_param_grid = {
-        "C": [0.1, 1.0, 10.0],
-        "penalty": ["l2"],
-    }
-    lr_search = RandomizedSearchCV(
-        LogisticRegression(max_iter=500, random_state=42),
-        lr_param_grid,
-        n_iter=2,
-        cv=tscv,
-        scoring="accuracy",
-        n_jobs=-1,
-        random_state=42,
-    )
-    lr_search.fit(X_train_scaled, y_train)
-    lr_best = lr_search.best_estimator_
-
-    # ── 3. SVM — tuned with RandomizedSearchCV ───────────────────────────
-    svm_param_grid = {
-        "C": [0.1, 1.0],
-        "gamma": ["scale", "auto"],
-    }
-    svm_search = RandomizedSearchCV(
-        SVC(probability=True, kernel="rbf", random_state=42),
-        svm_param_grid,
-        n_iter=2,
-        cv=tscv,
-        scoring="accuracy",
-        n_jobs=-1,
-        random_state=42,
-    )
-    svm_search.fit(X_train_scaled, y_train)
-    svm_best = svm_search.best_estimator_
+    # ── Tune each pipeline (all receive identical X_train / y_train) ─────
+    tuned_models: Dict[str, Pipeline] = {}
+    for name, pipeline in pipelines.items():
+        search = RandomizedSearchCV(
+            pipeline,
+            param_grids[name],
+            n_iter=n_iter_map[name],
+            cv=tscv,
+            scoring="accuracy",
+            n_jobs=-1,
+            random_state=42,
+        )
+        search.fit(X_train, y_train)
+        tuned_models[name] = search.best_estimator_
+        logger.info("  %s — best params: %s", name, search.best_params_)
 
     # ── Compare all 3 models on the held-out test set ────────────────────
-    models = {
-        "Random Forest": (rf_best, X_train, X_test),
-        "Logistic Regression": (lr_best, X_train_scaled, X_test_scaled),
-        "SVM": (svm_best, X_train_scaled, X_test_scaled),
-    }
-
+    # All pipelines receive identical X_test — internal scalers handle
+    # any necessary transformations.
     all_model_metrics = {}
     best_acc = -1.0
     best_model_name = ""
     best_model = None
-    best_xtest = None
 
-    for name, (model, _xtr, xte) in models.items():
-        y_pred_temp = model.predict(xte)
+    for name, model in tuned_models.items():
+        y_pred_temp = model.predict(X_test)
         acc = accuracy_score(y_test, y_pred_temp)
         prec = precision_score(y_test, y_pred_temp, zero_division=0)
         rec = recall_score(y_test, y_pred_temp, zero_division=0)
@@ -349,17 +489,16 @@ def train_and_predict(
             best_acc = acc
             best_model_name = name
             best_model = model
-            best_xtest = xte
 
     logger.info("[Selection] Best model: %s (accuracy=%.4f)", best_model_name, best_acc)
 
     # For feature importances we need a model with feature_importances_.
-    # If the best model doesn't have it (LR or SVM), use RF's importances
-    # but still score with the actual best model.
-    importance_model = rf_best  # RF always has .feature_importances_
+    # Always use RF's importances for interpretability — access the
+    # classifier step inside its Pipeline via named_steps.
+    importance_model = tuned_models["Random Forest"].named_steps["clf"]
 
-    y_pred = best_model.predict(best_xtest)
-    y_proba = best_model.predict_proba(best_xtest)
+    y_pred = best_model.predict(X_test)
+    y_proba = best_model.predict_proba(X_test)
 
     # ── Classification metrics (from the best model) ─────────────────────
     metrics = {
@@ -434,8 +573,12 @@ def run_backtest(
     Simulate the ML strategy vs Buy-and-Hold on the test period.
 
     ML Strategy:
-        On 'Buy' days (prediction=1), capture intraday return = (Close-Open)/Open.
-        On 'Sell/Hold' days, stay in cash (return = 0).
+        Prediction made after day T's close → trade on day T+1.
+        On 'Buy' signal, capture next day's intraday return = (Close-Open)/Open.
+        On 'Sell/Hold' signal, stay in cash (return = 0).
+
+    The prediction is shifted forward by 1 day so that a signal generated
+    from day T's features drives day T+1's trade, eliminating look-ahead bias.
 
     Sharpe Ratio (annualised):
         Sharpe = (mean(excess_return) / std(strategy_return)) × √252
@@ -444,21 +587,34 @@ def run_backtest(
     test = test_df.copy()
     test["prediction"] = y_pred
 
-    # Daily return captured by the strategy.
+    # Daily intraday return for each day.
     test["daily_return"] = (
         (test["close_price"] - test["open_price"]) / test["open_price"]
     )
-    test["strategy_return"] = test["daily_return"] * test["prediction"]
+
+    # ── Align prediction with execution ───────────────────────────────────
+    # Prediction[i] is generated using features known at day i's close.
+    # Therefore the trade happens on day i+1 (buy at open, sell at close).
+    # shift(1) moves each prediction forward so it drives the NEXT day's
+    # return.  The first day has no prior prediction → stays in cash (0).
+    test["strategy_return"] = test["daily_return"] * test["prediction"].shift(1).fillna(0)
 
     # ── Cumulative returns ────────────────────────────────────────────────
+    # Start cumulative tracking from the first day a trade can actually
+    # be executed (the second row, since the first row has no prediction).
     ml_cumulative = (1 + test["strategy_return"]).cumprod()
     ml_final_value = float(capital * ml_cumulative.iloc[-1])
 
-    bh_return = float(test["close_price"].iloc[-1] / test["open_price"].iloc[0])
+    # Buy-and-Hold: fully invested from Day 2 open (first tradeable day)
+    # to last day close — aligned with the ML strategy's tradeable window.
+    tradeable_start_idx = 1  # first day a prediction can drive a trade
+    bh_return = float(
+        test["close_price"].iloc[-1] / test["open_price"].iloc[tradeable_start_idx]
+    )
     bh_final_value = float(capital * bh_return)
 
     # Buy-and-Hold cumulative series for charting.
-    bh_cumulative = test["close_price"] / float(test["open_price"].iloc[0])
+    bh_cumulative = test["close_price"] / float(test["open_price"].iloc[tradeable_start_idx])
 
     # ── Sharpe Ratio ──────────────────────────────────────────────────────
     daily_rf = (

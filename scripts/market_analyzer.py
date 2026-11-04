@@ -32,6 +32,7 @@ import yfinance as yf
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.metrics import (
@@ -201,8 +202,10 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         group["Volume_Ratio"] = group["Volume"] / group["Vol_SMA_20"]
         group["Volume_Change"] = group["Volume"].pct_change()
 
-        # Target variable
-        group["Target"] = (close.shift(-1) > close).astype(int)
+        # Target variable: 1 if next day's intraday return is positive.
+        # Aligns with the backtest which captures (Close-Open)/Open on the
+        # day AFTER the prediction is generated, eliminating look-ahead bias.
+        group["Target"] = (close.shift(-1) > group["Open"].shift(-1)).astype(int)
         
         all_features.append(group)
 
@@ -247,11 +250,41 @@ def time_series_split(
     return train, test
 
 
+def build_models() -> dict[str, Pipeline]:
+    """
+    Model registry — returns the three candidate pipelines with sensible
+    default hyperparameters.
+
+    Each pipeline encapsulates its own preprocessing (StandardScaler for
+    models that require it), so all pipelines accept identical raw feature
+    matrices.  Hyperparameter tuning is the caller's responsibility.
+    """
+    return {
+        "Logistic Regression": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=1000, random_state=42)),
+        ]),
+        "Random Forest": Pipeline([
+            ("clf", RandomForestClassifier(
+                n_estimators=100, max_depth=10, random_state=42,
+            )),
+        ]),
+        "SVM": Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", SVC(
+                probability=True, kernel="rbf", random_state=42,
+            )),
+        ]),
+    }
+
+
 def train_model(
     train: pd.DataFrame, test: pd.DataFrame
 ) -> tuple[RandomForestClassifier, np.ndarray, pd.DataFrame]:
     """
-    Train and tune 3 models (Random Forest, Logistic Regression, SVM).
+    Train and tune 3 models (Random Forest, Logistic Regression, SVM)
+    using Pipeline-encapsulated preprocessing.  All models receive
+    identical feature matrices — each pipeline handles its own scaling.
     Selects the best model and returns it along with test predictions.
     """
     X_train = train[FEATURE_COLS]
@@ -259,57 +292,56 @@ def train_model(
     X_test = test[FEATURE_COLS]
     y_test = test["Target"]
 
-    # Scale features for SVM and Logistic Regression
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
     print("\n[Phase 3] Iterative Tuning of 3 Classification Models …")
+
+    # Build Pipeline-encapsulated models.
+    pipelines = build_models()
 
     # TimeSeriesSplit for cross-validation
     from sklearn.model_selection import TimeSeriesSplit
     tscv = TimeSeriesSplit(n_splits=3)
 
-    # 1. Random Forest (Tuning)
-    rf_params = {
-        'n_estimators': [100, 200, 300],
-        'max_depth': [5, 10, 15]
-    }
-    rf = RandomizedSearchCV(RandomForestClassifier(random_state=42), rf_params, n_iter=3, cv=tscv, n_jobs=-1, random_state=42)
-    rf.fit(X_train, y_train)
-    rf_best = rf.best_estimator_
-
-    # 2. Logistic Regression (Tuning)
-    lr_params = {'C': [0.1, 1, 10], 'penalty': ['l2']}
-    lr = RandomizedSearchCV(LogisticRegression(max_iter=1000, random_state=42), lr_params, n_iter=3, cv=tscv, n_jobs=-1, random_state=42)
-    lr.fit(X_train_scaled, y_train)
-    lr_best = lr.best_estimator_
-
-    # 3. SVM (Tuning)
-    svm_params = {'C': [0.1, 1, 10], 'gamma': ['scale', 'auto']}
-    svm = RandomizedSearchCV(SVC(kernel='rbf', probability=True, random_state=42), svm_params, n_iter=3, cv=tscv, n_jobs=-1, random_state=42)
-    svm.fit(X_train_scaled, y_train)
-    svm_best = svm.best_estimator_
-
-    # Evaluate
-    models = {
-        'Random Forest': (rf_best, X_train, X_test),
-        'Logistic Regression': (lr_best, X_train_scaled, X_test_scaled),
-        'SVM': (svm_best, X_train_scaled, X_test_scaled)
+    # Hyperparameter grids — clf__-prefixed for Pipeline compatibility.
+    param_grids = {
+        "Logistic Regression": {
+            "clf__C": [0.1, 1, 10],
+            "clf__penalty": ["l2"],
+        },
+        "Random Forest": {
+            "clf__n_estimators": [100, 200, 300],
+            "clf__max_depth": [5, 10, 15],
+        },
+        "SVM": {
+            "clf__C": [0.1, 1, 10],
+            "clf__gamma": ["scale", "auto"],
+        },
     }
 
+    # Tune each pipeline (all receive identical X_train / y_train).
+    tuned_models: dict[str, Pipeline] = {}
+    for name, pipeline in pipelines.items():
+        search = RandomizedSearchCV(
+            pipeline,
+            param_grids[name],
+            n_iter=3,
+            cv=tscv,
+            n_jobs=-1,
+            random_state=42,
+        )
+        search.fit(X_train, y_train)
+        tuned_models[name] = search.best_estimator_
+
+    # Evaluate all on the same X_test.
     best_acc = 0
     best_name = ""
     best_model = None
     best_pred = None
 
-    for name, (model, xtr, xte) in models.items():
-        y_pred = model.predict(xte)
+    for name, model in tuned_models.items():
+        y_pred = model.predict(X_test)
         acc = accuracy_score(y_test, y_pred)
         print(f"           {name:20s} Accuracy : {acc:.4f}")
-        
-        # If we hit 72% or close to it, we can highlight it. 
-        # In reality, tuning chooses the max.
+
         if acc > best_acc:
             best_acc = acc
             best_name = name
@@ -317,12 +349,13 @@ def train_model(
             best_pred = y_pred
 
     print(f"\n           [Selection] Best Model: {best_name} with Accuracy {best_acc:.4f}")
-    
-    # We return the best model (For feature importances we prefer RF)
-    if not hasattr(best_model, "feature_importances_"):
-        # If best is not RF, we still return RF for the importance chart downstream
-        best_model = rf_best
-        best_pred = rf_best.predict(X_test)
+
+    # For feature importances, extract the RF classifier from its Pipeline.
+    rf_clf = tuned_models["Random Forest"].named_steps["clf"]
+
+    # If best model is not RF, still use RF for the importance chart
+    # but keep the actual best model's predictions.
+    if best_name != "Random Forest":
         print("           (Using Random Forest downstream for feature importance visualisation)")
 
     # ---- Metrics ----
@@ -336,7 +369,8 @@ def train_model(
     print(f"           Recall    : {rec:.4f}")
     print(f"\n{classification_report(y_test, best_pred, target_names=['Sell/Hold (0)', 'Buy (1)'], zero_division=0)}")
 
-    return best_model, best_pred
+    # Return the RF classifier (for feature importances) and the best predictions.
+    return rf_clf, best_pred
 
 
 def print_feature_importances(model: RandomForestClassifier) -> pd.DataFrame:
@@ -375,14 +409,16 @@ def backtest(
 
     ML Strategy
     -----------
-    On each day the model predicts 1 (Buy), capture that day's daily return
-    (Close / Open - 1).  On days the model predicts 0, stay in cash (return = 0).
-    This mimics an intraday buy-at-open / sell-at-close approach.
+    Prediction is generated using day T's features (available after T's close).
+    On day T+1, if the prediction is 1 (Buy), capture that day's intraday
+    return (Close / Open - 1).  If prediction is 0, stay in cash (return = 0).
+    The prediction is shifted forward by 1 day to align signal generation with
+    actual trade execution, eliminating look-ahead bias.
 
     Buy-and-Hold Benchmark
     ----------------------
-    Buy at the first test-day's Open and sell at the last test-day's Close.
-    All capital is fully invested throughout.
+    Buy at the first tradeable day's Open (day 2 of the test set, since
+    day 1 has no prior prediction) and sell at the last test-day's Close.
 
     Sharpe Ratio
     ------------
@@ -396,19 +432,21 @@ def backtest(
     test = test.copy()
     test["Prediction"] = y_pred
 
-    # Daily return captured by the ML strategy.
-    # On 'Buy' days: return = (Close - Open) / Open
-    # On 'Sell/Hold' days: return = 0 (flat / cash)
+    # Daily intraday return for each day.
     test["Daily_Return"] = (test["Close"] - test["Open"]) / test["Open"]
-    test["Strategy_Return"] = test["Daily_Return"] * test["Prediction"]
+
+    # Align prediction with execution: shift predictions forward by 1 day.
+    # Prediction[i] is made after day i's close → drives day i+1's trade.
+    test["Strategy_Return"] = test["Daily_Return"] * test["Prediction"].shift(1).fillna(0)
 
     # ---- ML strategy final value ----
     cumulative = (1 + test["Strategy_Return"]).cumprod()
     ml_final_value = capital * cumulative.iloc[-1]
 
     # ---- Buy-and-Hold benchmark ----
-    # Fully invested from Day 1 open to last-day close.
-    bh_return = test["Close"].iloc[-1] / test["Open"].iloc[0]
+    # Aligned with the strategy's tradeable window (starts at day 2).
+    tradeable_start_idx = 1
+    bh_return = test["Close"].iloc[-1] / test["Open"].iloc[tradeable_start_idx]
     bh_final_value = capital * bh_return
 
     # ---- Sharpe Ratio (annualised) ----
