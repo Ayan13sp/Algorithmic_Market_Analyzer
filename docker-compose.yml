@@ -3,6 +3,7 @@
 # ════════════════════════════════════════════════════════════════════════
 # Services:
 #   db       – PostgreSQL 16 (persistent data)
+#   mlflow   – MLflow tracking server + model registry (http://localhost:5001)
 #   backend  – FastAPI + ML engine
 #   frontend – Next.js dashboard
 #
@@ -30,6 +31,25 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── MLflow Tracking Server ───────────────────────────────────────────
+  # Runs, metrics and the model registry live in SQLite; model artifacts are
+  # proxied through the server (--serve-artifacts), so the backend needs no
+  # shared filesystem.
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.18.0
+    restart: unless-stopped
+    command: >
+      mlflow server
+      --host 0.0.0.0 --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --artifacts-destination /mlflow/artifacts
+      --serve-artifacts
+      --allowed-hosts mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000
+    ports:
+      - "5001:5000"   # host 5001: macOS AirPlay Receiver already owns :5000
+    volumes:
+      - mlflowdata:/mlflow
+
   # ── FastAPI Backend ──────────────────────────────────────────────────
   backend:
     build:
@@ -40,9 +60,16 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql://market_user:market_pass@db:5432/market_analyzer
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      # Fail fast instead of MLflow's default multi-minute retry backoff
+      # if the tracking server is down (tracking is best-effort).
+      MLFLOW_HTTP_REQUEST_MAX_RETRIES: "1"
+      MLFLOW_HTTP_REQUEST_TIMEOUT: "10"
     depends_on:
       db:
         condition: service_healthy
+      mlflow:
+        condition: service_started
 
   # ── Next.js Frontend ────────────────────────────────────────────────
   frontend:
@@ -61,3 +88,4 @@ services:
 
 volumes:
   pgdata:
+  mlflowdata:

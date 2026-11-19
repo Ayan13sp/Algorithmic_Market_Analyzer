@@ -56,3 +56,7 @@ backend/__pycache__/
 # Local databases
 *.db
 *.sqlite3
+
+# MLflow
+mlruns/
+mlartifacts/

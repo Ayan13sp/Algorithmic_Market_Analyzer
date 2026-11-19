@@ -142,6 +142,10 @@ class AnalysisResponse(BaseModel):
         default_factory=dict,
         description="Metrics for each of the 3 compared models"
     )
+    mlflow_run_id: Optional[str] = Field(
+        default=None,
+        description="MLflow run that recorded this analysis (null when tracking is off)",
+    )
 
 
 class HealthResponse(BaseModel):

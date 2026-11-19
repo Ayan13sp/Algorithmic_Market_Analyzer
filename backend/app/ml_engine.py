@@ -18,7 +18,7 @@ Pipeline:
 import logging
 import warnings
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -32,8 +32,10 @@ from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
 from sklearn.metrics import accuracy_score, precision_score, recall_score
 from sqlalchemy.orm import Session
 
+from app import tracking
 from app.config import settings
 from app.models import MarketData, ModelPrediction
+from app.tracking import ExperimentTracker
 
 warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
@@ -47,6 +49,23 @@ FEATURE_COLS = [
     "bb_upper", "bb_lower", "atr_14", "daily_return_vol",
     "volume_ratio", "volume_change",
 ]
+
+# Logical feature families — used by the feature-ablation experiments
+# (experiments/feature_ablation.py) to measure each family's contribution.
+FEATURE_GROUPS: Dict[str, List[str]] = {
+    "trend": ["sma_14", "sma_50", "sma_200", "ema_14", "ema_20", "ema_50"],
+    "momentum": ["rsi_14", "macd_line", "macd_signal", "macd_hist"],
+    "volatility": ["bb_upper", "bb_lower", "atr_14", "daily_return_vol"],
+    "volume": ["volume_ratio", "volume_change"],
+}
+
+# Bump when the feature engineering logic changes, so tracked experiments
+# from different feature definitions are never silently compared.
+FEATURE_SET_VERSION = "v1-16-technical"
+
+TRAIN_RATIO = 0.80
+CV_SPLITS = 3
+RANDOM_STATE = 42
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -157,17 +176,8 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 # PHASE 1 — DATA ACQUISITION & STORAGE
 # ═══════════════════════════════════════════════════════════════════════════
 
-def fetch_and_store(
-    ticker: str,
-    years: int,
-    db: Session,
-) -> pd.DataFrame:
-    """
-    Download OHLCV data from Yahoo Finance, engineer features, and
-    upsert all rows into the MarketData table.
-
-    Returns the cleaned DataFrame (with features) for downstream use.
-    """
+def download_ohlcv(ticker: str, years: int) -> pd.DataFrame:
+    """Download and clean daily OHLCV data from Yahoo Finance (no features)."""
     end_date = datetime.today()
     start_date = end_date - timedelta(days=years * 365)
 
@@ -188,9 +198,21 @@ def fetch_and_store(
     raw.ffill(inplace=True)
     raw.bfill(inplace=True)
     raw.dropna(inplace=True)
+    return raw
 
-    # Engineer statistical features.
-    df = engineer_features(raw)
+
+def fetch_and_store(
+    ticker: str,
+    years: int,
+    db: Session,
+) -> pd.DataFrame:
+    """
+    Download OHLCV data from Yahoo Finance, engineer features, and
+    upsert all rows into the MarketData table.
+
+    Returns the cleaned DataFrame (with features) for downstream use.
+    """
+    df = engineer_features(download_ohlcv(ticker, years))
 
     # ── Bulk upsert into database ─────────────────────────────────────────
     # Delete existing rows for this ticker, then insert fresh data.
@@ -238,13 +260,16 @@ def fetch_and_store(
 # STAGE 1 — MODEL REGISTRY, VALIDATION & DATA PREPARATION
 # ═══════════════════════════════════════════════════════════════════════════
 
-def validate_training_data(df: pd.DataFrame) -> None:
+def validate_training_data(
+    df: pd.DataFrame,
+    feature_cols: Optional[List[str]] = None,
+) -> None:
     """
     Fail-fast validation of a DataFrame before model training.
 
     Checks:
         1. DataFrame is not empty.
-        2. All 16 FEATURE_COLS are present.
+        2. All feature columns (default: the 16 FEATURE_COLS) are present.
         3. The 'target' column exists.
         4. No NaN or infinite values in features + target.
         5. Target values are binary (0 or 1).
@@ -253,10 +278,11 @@ def validate_training_data(df: pd.DataFrame) -> None:
     Raises:
         ValueError: With a descriptive message if any check fails.
     """
+    feature_cols = feature_cols or FEATURE_COLS
     if df.empty:
         raise ValueError("Training DataFrame is empty — no rows to train on.")
 
-    missing_features = [c for c in FEATURE_COLS if c not in df.columns]
+    missing_features = [c for c in feature_cols if c not in df.columns]
     if missing_features:
         raise ValueError(
             f"Missing {len(missing_features)} feature column(s): {missing_features}"
@@ -265,7 +291,7 @@ def validate_training_data(df: pd.DataFrame) -> None:
     if "target" not in df.columns:
         raise ValueError("Missing 'target' column in DataFrame.")
 
-    check_cols = FEATURE_COLS + ["target"]
+    check_cols = feature_cols + ["target"]
     nan_counts = df[check_cols].isna().sum()
     cols_with_nans = nan_counts[nan_counts > 0]
     if not cols_with_nans.empty:
@@ -275,7 +301,7 @@ def validate_training_data(df: pd.DataFrame) -> None:
         )
 
     # Check for ±inf in numeric feature columns.
-    inf_mask = np.isinf(df[FEATURE_COLS].select_dtypes(include=[np.number]))
+    inf_mask = np.isinf(df[feature_cols].select_dtypes(include=[np.number]))
     cols_with_infs = inf_mask.any()
     cols_with_infs = cols_with_infs[cols_with_infs].index.tolist()
     if cols_with_infs:
@@ -298,7 +324,8 @@ def validate_training_data(df: pd.DataFrame) -> None:
 
 def prepare_train_test_split(
     df: pd.DataFrame,
-    train_ratio: float = 0.80,
+    train_ratio: float = TRAIN_RATIO,
+    feature_cols: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Prepare chronological train/test split with defensive data cleaning.
@@ -315,6 +342,8 @@ def prepare_train_test_split(
     Raises:
         ValueError: If the index is not in chronological order.
     """
+    feature_cols = feature_cols or FEATURE_COLS
+
     # ── Chronological ordering guard ──────────────────────────────────────
     if not df.index.is_monotonic_increasing:
         raise ValueError(
@@ -327,7 +356,7 @@ def prepare_train_test_split(
     clean = df.copy()
     clean = clean.replace([np.inf, -np.inf], np.nan)
     rows_before = len(clean)
-    clean = clean.dropna(subset=FEATURE_COLS + ["target"])
+    clean = clean.dropna(subset=feature_cols + ["target"])
     rows_dropped = rows_before - len(clean)
     if rows_dropped > 0:
         logger.warning(
@@ -340,9 +369,9 @@ def prepare_train_test_split(
     train_df = clean.iloc[:split_idx].copy()
     test_df = clean.iloc[split_idx:].copy()
 
-    X_train = train_df[FEATURE_COLS]
+    X_train = train_df[feature_cols]
     y_train = train_df["target"]
-    X_test = test_df[FEATURE_COLS]
+    X_test = test_df[feature_cols]
     y_test = test_df["target"]
 
     logger.info(
@@ -377,17 +406,17 @@ def build_models() -> Dict[str, Pipeline]:
     return {
         "Logistic Regression": Pipeline([
             ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(max_iter=500, random_state=42)),
+            ("clf", LogisticRegression(max_iter=500, random_state=RANDOM_STATE)),
         ]),
         "Random Forest": Pipeline([
             ("clf", RandomForestClassifier(
-                n_estimators=100, max_depth=10, random_state=42,
+                n_estimators=100, max_depth=10, random_state=RANDOM_STATE,
             )),
         ]),
         "SVM": Pipeline([
             ("scaler", StandardScaler()),
             ("clf", SVC(
-                probability=True, kernel="rbf", random_state=42,
+                probability=True, kernel="rbf", random_state=RANDOM_STATE,
             )),
         ]),
     }
@@ -397,10 +426,36 @@ def build_models() -> Dict[str, Pipeline]:
 # PHASE 3 — MODEL TRAINING & PREDICTION (uses Stage 1 components)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Hyperparameter search spaces (clf__-prefixed for Pipeline compatibility).
+PARAM_GRIDS: Dict[str, Dict[str, list]] = {
+    "Logistic Regression": {
+        "clf__C": [0.1, 1.0, 10.0],
+        "clf__penalty": ["l2"],
+    },
+    "Random Forest": {
+        "clf__n_estimators": [50, 100],
+        "clf__max_depth": [5, 10, None],
+        "clf__min_samples_split": [2, 5],
+    },
+    "SVM": {
+        "clf__C": [0.1, 1.0],
+        "clf__gamma": ["scale", "auto"],
+    },
+}
+# Kept small so API responses stay fast on free-tier hosting.
+N_ITER: Dict[str, int] = {
+    "Logistic Regression": 2,
+    "Random Forest": 3,
+    "SVM": 2,
+}
+
+
 def train_and_predict(
     df: pd.DataFrame,
     ticker: str,
-    db: Session,
+    db: Optional[Session] = None,
+    feature_cols: Optional[List[str]] = None,
+    tracker: Optional[ExperimentTracker] = None,
 ) -> Dict[str, Any]:
     """
     Train and tune 3 classifiers (Random Forest, Logistic Regression, SVM)
@@ -410,59 +465,76 @@ def train_and_predict(
     Cross-validation uses sklearn's TimeSeriesSplit to prevent future
     data leakage during hyperparameter tuning.
 
+    Args:
+        df: Engineered feature DataFrame (see ``engineer_features``).
+        ticker: Ticker symbol, used for persistence and tracking.
+        db: Optional session. When given, predictions are stored in the
+            model_predictions table; offline experiments pass ``None``.
+        feature_cols: Feature subset to train on (default: all 16).
+        tracker: Optional MLflow tracker. Each candidate model is logged
+            as a nested run; the selected model is logged as an artifact.
+
     Returns a dict with keys:
         train_size, test_size, metrics, feature_importances,
         predictions, test_df, best_model_name
     """
+    feature_cols = list(feature_cols or FEATURE_COLS)
+    tracker = tracker or tracking.NULL_TRACKER
+
     # ── Validate and prepare data ─────────────────────────────────────────
-    validate_training_data(df)
-    split = prepare_train_test_split(df, train_ratio=0.80)
+    validate_training_data(df, feature_cols)
+    split = prepare_train_test_split(df, TRAIN_RATIO, feature_cols)
     X_train, X_test = split["X_train"], split["X_test"]
     y_train, y_test = split["y_train"], split["y_test"]
     train, test = split["train_df"], split["test_df"]
 
+    # Naive baseline: always predict the majority class seen in training.
+    # Any model that cannot beat this has learned nothing useful.
+    majority_class = int(y_train.mean() >= 0.5)
+    baseline_acc = float((y_test == majority_class).mean())
+
+    tracker.log_params({
+        "ticker": ticker,
+        "feature_set_version": FEATURE_SET_VERSION,
+        "n_features": len(feature_cols),
+        "features": ",".join(feature_cols),
+        "train_ratio": TRAIN_RATIO,
+        "cv_strategy": f"TimeSeriesSplit(n_splits={CV_SPLITS})",
+        "random_state": RANDOM_STATE,
+        "train_start": train.index[0].strftime("%Y-%m-%d"),
+        "train_end": train.index[-1].strftime("%Y-%m-%d"),
+        "test_start": test.index[0].strftime("%Y-%m-%d"),
+        "test_end": test.index[-1].strftime("%Y-%m-%d"),
+        "train_size": len(train),
+        "test_size": len(test),
+    })
+    tracker.log_metrics({
+        "train_positive_rate": float(y_train.mean()),
+        "test_positive_rate": float(y_test.mean()),
+        "baseline_majority_accuracy": baseline_acc,
+    })
+    tracker.log_dataset(train, feature_cols, name=f"{ticker}-train", context="training")
+    tracker.log_dataset(test, feature_cols, name=f"{ticker}-test", context="testing")
+
     # ── Build model pipelines ─────────────────────────────────────────────
     pipelines = build_models()
-
-    # ── Hyperparameter grids (clf__-prefixed for Pipeline compatibility) ──
-    param_grids = {
-        "Logistic Regression": {
-            "clf__C": [0.1, 1.0, 10.0],
-            "clf__penalty": ["l2"],
-        },
-        "Random Forest": {
-            "clf__n_estimators": [50, 100],
-            "clf__max_depth": [5, 10, None],
-            "clf__min_samples_split": [2, 5],
-        },
-        "SVM": {
-            "clf__C": [0.1, 1.0],
-            "clf__gamma": ["scale", "auto"],
-        },
-    }
-    n_iter_map = {
-        "Logistic Regression": 2,
-        "Random Forest": 3,
-        "SVM": 2,
-    }
-
-    # ── TimeSeriesSplit for cross-validation ──────────────────────────────
-    # Reduced to 3 splits to ensure fast API responses on free tier hosting
-    tscv = TimeSeriesSplit(n_splits=3)
+    tscv = TimeSeriesSplit(n_splits=CV_SPLITS)
 
     # ── Tune each pipeline (all receive identical X_train / y_train) ─────
+    searches: Dict[str, RandomizedSearchCV] = {}
     tuned_models: Dict[str, Pipeline] = {}
     for name, pipeline in pipelines.items():
         search = RandomizedSearchCV(
             pipeline,
-            param_grids[name],
-            n_iter=n_iter_map[name],
+            PARAM_GRIDS[name],
+            n_iter=N_ITER[name],
             cv=tscv,
             scoring="accuracy",
             n_jobs=-1,
-            random_state=42,
+            random_state=RANDOM_STATE,
         )
         search.fit(X_train, y_train)
+        searches[name] = search
         tuned_models[name] = search.best_estimator_
         logger.info("  %s — best params: %s", name, search.best_params_)
 
@@ -492,6 +564,15 @@ def train_and_predict(
 
     logger.info("[Selection] Best model: %s (accuracy=%.4f)", best_model_name, best_acc)
 
+    # One nested run per candidate: search space, best params, CV + test scores.
+    for name, search in searches.items():
+        tracker.log_candidate(
+            name,
+            search,
+            all_model_metrics[name],
+            is_best=(name == best_model_name),
+        )
+
     # For feature importances we need a model with feature_importances_.
     # Always use RF's importances for interpretability — access the
     # classifier step inside its Pipeline via named_steps.
@@ -511,11 +592,20 @@ def train_and_predict(
     importances = [
         {"feature": feat, "importance": float(imp)}
         for feat, imp in sorted(
-            zip(FEATURE_COLS, importance_model.feature_importances_),
+            zip(feature_cols, importance_model.feature_importances_),
             key=lambda x: x[1],
             reverse=True,
         )
     ]
+
+    # ── Track the selected model ──────────────────────────────────────────
+    tracker.set_tags({"best_model": best_model_name})
+    tracker.log_metrics({
+        f"test_{k}": v for k, v in metrics.items()
+    } | {"accuracy_lift_over_baseline": metrics["accuracy"] - baseline_acc})
+    tracker.log_feature_importances(importances)
+    tracker.log_dict(all_model_metrics, "model_comparison.json")
+    tracker.log_model(best_model, X_train, ticker=ticker, model_name=best_model_name)
 
     # ── Build prediction records ──────────────────────────────────────────
     predictions = []
@@ -531,17 +621,19 @@ def train_and_predict(
         })
 
         # Store in model_predictions table.
-        db.add(
-            ModelPrediction(
-                ticker=ticker,
-                prediction_date=idx.date(),
-                predicted_signal=signal,
-                confidence_score=confidence,
-                actual_outcome=int(row["target"]),
+        if db is not None:
+            db.add(
+                ModelPrediction(
+                    ticker=ticker,
+                    prediction_date=idx.date(),
+                    predicted_signal=signal,
+                    confidence_score=confidence,
+                    actual_outcome=int(row["target"]),
+                )
             )
-        )
 
-    db.commit()
+    if db is not None:
+        db.commit()
     logger.info(
         "Best model: %s — accuracy=%.4f, precision=%.4f, recall=%.4f",
         best_model_name, metrics["accuracy"], metrics["precision"], metrics["recall"],
@@ -676,22 +768,30 @@ def run_full_analysis(
     This is the main entry point called by the /api/analyze endpoint.
     Returns a fully structured dict ready for AnalysisResponse serialisation.
     """
-    # Phase 1+2: Fetch data, engineer features, store in DB.
-    df = fetch_and_store(ticker, years, db)
+    # Every analysis is one MLflow run; it is a no-op when tracking is off.
+    with tracking.start_run(
+        run_name=f"{ticker}-analysis",
+        tags={"ticker": ticker, "source": "api"},
+    ) as tracker:
+        tracker.log_params({"lookback_years": years, "starting_capital": capital})
 
-    # Clear old predictions for this ticker.
-    db.query(ModelPrediction).filter(ModelPrediction.ticker == ticker).delete()
-    db.commit()
+        # Phase 1+2: Fetch data, engineer features, store in DB.
+        df = fetch_and_store(ticker, years, db)
 
-    # Phase 3: Train model, generate predictions.
-    ml_results = train_and_predict(df, ticker, db)
+        # Clear old predictions for this ticker.
+        db.query(ModelPrediction).filter(ModelPrediction.ticker == ticker).delete()
+        db.commit()
 
-    # Phase 4: Backtest the strategy.
-    backtest_results = run_backtest(
-        ml_results["test_df"],
-        ml_results["y_pred"],
-        capital,
-    )
+        # Phase 3: Train model, generate predictions.
+        ml_results = train_and_predict(df, ticker, db, tracker=tracker)
+
+        # Phase 4: Backtest the strategy.
+        backtest_results = run_backtest(
+            ml_results["test_df"],
+            ml_results["y_pred"],
+            capital,
+        )
+        tracker.log_backtest(backtest_results)
 
     # ── Assemble market_data for the frontend ─────────────────────────────
     market_data = []
@@ -745,4 +845,5 @@ def run_full_analysis(
         "backtest": backtest_results,
         "best_model": ml_results["best_model_name"],
         "all_model_metrics": ml_results["all_model_metrics"],
+        "mlflow_run_id": tracker.run_id,
     }

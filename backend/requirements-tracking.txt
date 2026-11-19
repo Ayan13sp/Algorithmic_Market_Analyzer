@@ -1,0 +1,3 @@
+# Optional: MLflow experiment tracking (see app/tracking.py).
+# Not installed on the free-tier Render deploy; tracking is then a no-op.
+mlflow>=3.18,<4

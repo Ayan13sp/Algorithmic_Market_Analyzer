@@ -1,1 +1,2 @@
+-r requirements-tracking.txt
 pytest>=8.0.0
