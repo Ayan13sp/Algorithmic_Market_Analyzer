@@ -1,10 +1,9 @@
 # Algorithmic Market Analyzer & Trade Classifier
 
-[![CI Status](https://github.com/Ayan13sp/banking/actions/workflows/ci.yml/badge.svg)](https://github.com/Ayan13sp/banking/actions/workflows/ci.yml)
+[![CI Status](https://github.com/Ayan13sp/Algorithmic_Market_Analyzer/actions/workflows/ci.yml/badge.svg)](https://github.com/Ayan13sp/Algorithmic_Market_Analyzer/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Next.js 16](https://img.shields.io/badge/frontend-Next.js%2016-black.svg)](https://nextjs.org/)
 [![FastAPI](https://img.shields.io/badge/backend-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-35%20passed-brightgreen.svg)](backend/tests/)
 
 A production-grade, full-stack quantitative analysis and machine learning platform designed for Indian equities (NSE & BSE). The system acquires multi-year OHLCV data from Yahoo Finance, engineers 16 mathematical and statistical indicators, trains and benchmarks multiple classification pipelines using walk-forward cross-validation, and runs a realistic backtest against a buy-and-hold benchmark — presented via an interactive Next.js dashboard powered by TradingView Lightweight Charts.
@@ -253,11 +252,9 @@ curl -X POST http://localhost:8000/api/analyze \
 │   ├── market_analyzer.py     # Standalone analytical pipeline & Matplotlib dashboard
 │   └── requirements.txt
 ├── docs/
-│   ├── market_analyzer_dashboard.png # High-resolution analytical output
-│   └── INTERVIEW_GUIDE.md     # Technical deep-dive & interview Q&A guide
+│   └── market_analyzer_dashboard.png # High-resolution analytical output
 ├── .github/workflows/ci.yml   # Multi-stage CI pipeline (pytest, ESLint, tsc)
 ├── docker-compose.yml         # Containerized multi-service orchestration
-├── LICENSE                    # MIT License
 └── render.yaml                # Production deployment blueprint (Render + Neon)
 ```
 
