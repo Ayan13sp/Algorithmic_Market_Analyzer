@@ -39,6 +39,17 @@ class Settings(BaseSettings):
     DEFAULT_STARTING_CAPITAL: float = 100_000.0  # INR
     DEFAULT_LOOKBACK_YEARS: int = 5
 
+    # ── Experiment Tracking (MLflow) ──────────────────────────────────────
+    # No-op automatically if the `mlflow` package is not installed.
+    MLFLOW_ENABLED: bool = True
+    # Local default: a SQLite store in backend/ (supports the model registry).
+    # Point at a server instead, e.g. http://localhost:5000 (docker compose).
+    MLFLOW_TRACKING_URI: str = "sqlite:///mlflow.db"
+    MLFLOW_EXPERIMENT_NAME: str = "market-direction-classifier"
+    # Register each selected model as a new version of
+    # "market-direction-<TICKER>" in the MLflow Model Registry.
+    MLFLOW_REGISTER_MODELS: bool = True
+
     @property
     def all_cors_origins(self) -> List[str]:
         """Combine static and dynamic CORS origins."""

@@ -3,11 +3,19 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install dependencies first (layer caching).
-COPY requirements.txt .
+COPY requirements.txt requirements-tracking.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+
+# MLflow tracking client (optional; build with --build-arg WITH_TRACKING=false
+# for a smaller image — tracking then becomes a no-op).
+ARG WITH_TRACKING=true
+RUN if [ "$WITH_TRACKING" = "true" ]; then \
+      pip install --no-cache-dir -r requirements-tracking.txt; \
+    fi
 
 # Copy application code.
 COPY app/ ./app/
+COPY experiments/ ./experiments/
 
 # Expose the API port.
 EXPOSE 8000

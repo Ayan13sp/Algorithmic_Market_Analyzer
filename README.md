@@ -1,13 +1,14 @@
 # Algorithmic Market Analyzer & Trade Classifier
 
-[![CI Status](https://github.com/Ayan13sp/banking/actions/workflows/ci.yml/badge.svg)](https://github.com/Ayan13sp/banking/actions/workflows/ci.yml)
+[![CI Status](https://github.com/Ayan13sp/Algorithmic_Market_Analyzer/actions/workflows/ci.yml/badge.svg)](https://github.com/Ayan13sp/Algorithmic_Market_Analyzer/actions/workflows/ci.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Next.js 16](https://img.shields.io/badge/frontend-Next.js%2016-black.svg)](https://nextjs.org/)
 [![FastAPI](https://img.shields.io/badge/backend-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-26%20passed-brightgreen.svg)](backend/tests/)
+[![Tests](https://img.shields.io/badge/tests-35%20passed-brightgreen.svg)](backend/tests/)
 
 A production-grade, full-stack quantitative analysis and machine learning platform designed for Indian equities (NSE & BSE). The system acquires multi-year OHLCV data from Yahoo Finance, engineers 16 mathematical and statistical indicators, trains and benchmarks multiple classification pipelines using walk-forward cross-validation, and runs a realistic backtest against a buy-and-hold benchmark — presented via an interactive Next.js dashboard powered by TradingView Lightweight Charts.
+
+**Live demo:** [Dashboard](https://banking-frontend-46vb.onrender.com/) · [API docs (Swagger)](https://banking-backend-ce7i.onrender.com/docs). Hosted on Render's free tier: the services sleep when idle, so the first load can take a minute or two.
 
 ![Dashboard produced by the standalone pipeline for RELIANCE.NS](docs/market_analyzer_dashboard.png)
 
@@ -21,6 +22,7 @@ A production-grade, full-stack quantitative analysis and machine learning platfo
 - **Leakage-Free Cross-Validation**: Implements `sklearn.pipeline.Pipeline` with `StandardScaler` fitted strictly inside each walk-forward fold via `TimeSeriesSplit(n_splits=3)`. Test folds and future intervals never contaminate feature scalers.
 - **Dual Verification (Pandas vs SQL Window Functions)**: Computes rolling indicators in both Pandas vectorized series and PostgreSQL/SQLite window functions (`AVG(close_price) OVER (ORDER BY date ROWS BETWEEN 13 PRECEDING AND CURRENT ROW)`) to cross-validate analytical accuracy.
 - **Fail-Fast Data Quality Validation**: Validates feature distributions, monotonicity of timestamps, and eliminates division-by-zero infinite values from volatility and volume spikes before model consumption.
+- **Experiment Tracking with MLflow**: Every analysis is an MLflow run logging the feature set, dataset digests, hyperparameter search spaces, per-candidate CV/test scores (as nested runs), a majority-class baseline, backtest metrics, plots, and the selected sklearn pipeline, which is versioned in the MLflow Model Registry. A feature-ablation runner measures each indicator family's contribution.
 - **Honest Financial Benchmarking**: Evaluates strategies using annualised Sharpe ratios (risk-free rate 6.5% for Indian Sovereign Yield) and acknowledges market microstructure realities rather than reporting deceptive 90%+ unfeasible accuracies.
 
 ---
@@ -40,6 +42,12 @@ graph TB
         VAL[Fail-Fast Data Validator]
         ML[ML Pipeline Registry]
         SA[SQLAlchemy 2.0 ORM]
+        TR[Experiment Tracker]
+    end
+
+    subgraph MLOps ["MLflow Tracking Server"]
+        RUNS[(Runs: params, metrics, datasets)]
+        REG[(Model Registry + artifacts)]
     end
 
     subgraph DataLayer ["Data Storage (PostgreSQL / SQLite)"]
@@ -59,6 +67,9 @@ graph TB
     API --> SA
     ML --> YF
     ML --> SA
+    ML --> TR
+    TR --> RUNS
+    TR --> REG
     SA --> MD
     SA --> MP
 ```
@@ -73,6 +84,7 @@ graph TB
 | **Charting** | TradingView Lightweight Charts | Institutional-grade financial candlestick & overlay rendering |
 | **Backend API** | FastAPI, Pydantic v2, Python 3.11+ | Asynchronous REST endpoints, typed schema validation, CORS |
 | **ML & Quant** | scikit-learn, pandas, numpy | Pipelines, `TimeSeriesSplit`, `RandomizedSearchCV`, Random Forest, SVM, Logistic Regression |
+| **MLOps** | MLflow 3 | Experiment tracking, dataset lineage, nested runs per candidate, model registry |
 | **Database** | PostgreSQL (Neon / Docker), SQLite | SQLAlchemy 2.0 ORM, indexed OHLCV time series, SQL window functions |
 | **DevOps & CI** | Docker Compose, GitHub Actions, Render | Continuous integration (pytest, ESLint, type-checking), cloud container deployment |
 
@@ -110,7 +122,47 @@ Out-of-Sample Evaluation & Model Selection
        ▼
 Execution-Lagged Backtesting
   └─ Day T Prediction executed on Day T+1 (Open-to-Close). Benchmarked vs Buy & Hold.
+       │
+       ▼
+MLflow Tracking (every step above is logged to one run)
 ```
+
+---
+
+## Experiment Tracking (MLflow)
+
+Each `/api/analyze` call creates one MLflow run, and the response includes its `mlflow_run_id`.
+
+| What is logged | Where |
+|---|---|
+| Ticker, feature list, feature-set version, train/test date ranges, CV strategy, seed, git commit | Run params & tags |
+| Train and test feature matrices (schema + content digest) | Run inputs (MLflow Datasets) |
+| Test accuracy / precision / recall, **majority-class baseline**, lift over baseline | Run metrics |
+| Backtest return, buy-and-hold return, excess return, Sharpe ratio | Run metrics |
+| Feature importances (JSON + chart), equity curve, model comparison | Run artifacts |
+| One child run per candidate: search space, best hyperparameters, CV mean/std, fit time, full `cv_results_` | Nested runs |
+| Selected sklearn `Pipeline` with input/output signature | Model artifact, registered as `market-direction-<TICKER>` |
+
+The baseline metric exists to catch a degenerate model that predicts the majority class on every day. Such a model can post a high accuracy while carrying no signal, and `accuracy_lift_over_baseline` shows it immediately.
+
+**Local (SQLite store, no server needed):**
+```bash
+cd backend
+pip install -r requirements.txt -r requirements-dev.txt   # dev includes MLflow
+uvicorn app.main:app --reload --port 8000                 # runs log to ./mlflow.db
+mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5001
+```
+
+**Feature-ablation study:** retrains the full pipeline with all features and then with each indicator family left out. Each config becomes a run tagged with a shared `study_id`:
+```bash
+cd backend
+python -m experiments.feature_ablation --tickers RELIANCE.NS TCS.NS INFY.NS
+python -m experiments.feature_ablation --tickers RELIANCE.NS --include-single   # also each family alone
+```
+
+**Docker Compose:** an MLflow server is included. Open [http://localhost:5001](http://localhost:5001). Host port 5001 is used because macOS reserves port 5000 for AirPlay.
+
+Tracking is optional and fail-soft. If `mlflow` is not installed (as on the free-tier Render deploy), `MLFLOW_ENABLED=false` is set, or the server is unreachable, the pipeline runs unchanged and only logs a warning. See [`backend/.env.example`](backend/.env.example) for settings.
 
 ---
 
@@ -118,14 +170,15 @@ Execution-Lagged Backtesting
 
 ### Option 1: Docker Compose (Recommended)
 
-Spins up the FastAPI backend, PostgreSQL database, and Next.js frontend with a single command:
+Spins up the FastAPI backend, PostgreSQL database, MLflow tracking server, and Next.js frontend with a single command:
 
 ```bash
 docker compose up --build
 ```
 
-- **Frontend Dashboard**: [https://banking-frontend-46vb.onrender.com/](https://banking-frontend-46vb.onrender.com/)
-- **Interactive Swagger Docs**: [https://banking-frontend-46vb.onrender.com/docs](https://banking-frontend-46vb.onrender.com/docs)
+- **Frontend Dashboard**: [http://localhost:3000](http://localhost:3000)
+- **Interactive Swagger Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **MLflow UI**: [http://localhost:5001](http://localhost:5001)
 
 ---
 
@@ -184,8 +237,11 @@ curl -X POST http://localhost:8000/api/analyze \
 │   │   ├── models.py          # Database ORM schema (MarketData, ModelPrediction)
 │   │   ├── schemas.py         # Pydantic v2 validation and response schemas
 │   │   ├── ml_engine.py       # Feature engineering, ML pipelines, backtester
+│   │   ├── tracking.py        # MLflow experiment tracking (optional, fail-soft)
 │   │   └── api_routes.py      # REST route handlers
-│   ├── tests/                 # Comprehensive pytest suite (indicators, pipelines, splits)
+│   ├── experiments/
+│   │   └── feature_ablation.py # Leave-one-group-out feature study, tracked in MLflow
+│   ├── tests/                 # pytest suite (indicators, pipelines, splits, tracking)
 │   ├── Dockerfile.backend
 │   └── requirements.txt
 ├── frontend/
@@ -199,11 +255,9 @@ curl -X POST http://localhost:8000/api/analyze \
 │   ├── market_analyzer.py     # Standalone analytical pipeline & Matplotlib dashboard
 │   └── requirements.txt
 ├── docs/
-│   ├── market_analyzer_dashboard.png # High-resolution analytical output
-│   └── INTERVIEW_GUIDE.md     # Technical deep-dive & interview Q&A guide
+│   └── market_analyzer_dashboard.png # High-resolution analytical output
 ├── .github/workflows/ci.yml   # Multi-stage CI pipeline (pytest, ESLint, tsc)
 ├── docker-compose.yml         # Containerized multi-service orchestration
-├── LICENSE                    # MIT License
 └── render.yaml                # Production deployment blueprint (Render + Neon)
 ```
 
@@ -223,6 +277,7 @@ Tests verify:
 2. Pipeline isolation: feature scaling applied strictly inside cross-validation splits.
 3. Monotonic chronological ordering and rejection of unsorted time-series data.
 4. Input validation (graceful handling of division-by-zero, NaNs, and extreme volatilities).
+5. MLflow tracking: parent/nested run structure, dataset inputs, artifacts, registry round-trip for every model family, FAILED status on pipeline errors, and fail-soft behaviour when the tracking backend is unreachable.
 
 ---
 

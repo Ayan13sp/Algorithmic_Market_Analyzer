@@ -23,24 +23,6 @@ from app.ml_engine import (
 
 
 @pytest.fixture
-def ohlcv() -> pd.DataFrame:
-    rng = np.random.default_rng(0)
-    n = 400
-    close = 100 + np.cumsum(rng.normal(0, 1, n))
-    idx = pd.date_range("2022-01-03", periods=n, freq="B")
-    return pd.DataFrame(
-        {
-            "open_price": close + rng.normal(0, 0.3, n),
-            "high_price": close + 1.0,
-            "low_price": close - 1.0,
-            "close_price": close,
-            "volume": rng.integers(1_000, 5_000, n).astype(float),
-        },
-        index=idx,
-    )
-
-
-@pytest.fixture
 def engineered_df(ohlcv) -> pd.DataFrame:
     """Fully engineered DataFrame ready for model training."""
     return engineer_features(ohlcv.copy())
