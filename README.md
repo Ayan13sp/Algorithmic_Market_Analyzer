@@ -8,6 +8,8 @@
 
 A production-grade, full-stack quantitative analysis and machine learning platform designed for Indian equities (NSE & BSE). The system acquires multi-year OHLCV data from Yahoo Finance, engineers 16 mathematical and statistical indicators, trains and benchmarks multiple classification pipelines using walk-forward cross-validation, and runs a realistic backtest against a buy-and-hold benchmark — presented via an interactive Next.js dashboard powered by TradingView Lightweight Charts.
 
+**Live demo:** [Dashboard](https://banking-frontend-46vb.onrender.com/) · [API docs (Swagger)](https://banking-backend-ce7i.onrender.com/docs). Hosted on Render's free tier: the services sleep when idle, so the first load can take a minute or two.
+
 ![Dashboard produced by the standalone pipeline for RELIANCE.NS](docs/market_analyzer_dashboard.png)
 
 *Output of `scripts/market_analyzer.py` on RELIANCE.NS: Bollinger Bands, ML vs buy-and-hold cumulative returns, RSI-14, and Random Forest feature importances over the held-out test period.*
@@ -168,14 +170,15 @@ Tracking is optional and fail-soft. If `mlflow` is not installed (as on the free
 
 ### Option 1: Docker Compose (Recommended)
 
-Spins up the FastAPI backend, PostgreSQL database, and Next.js frontend with a single command:
+Spins up the FastAPI backend, PostgreSQL database, MLflow tracking server, and Next.js frontend with a single command:
 
 ```bash
 docker compose up --build
 ```
 
-- **Frontend Dashboard**: [https://banking-frontend-46vb.onrender.com/](https://banking-frontend-46vb.onrender.com/)
-- **Interactive Swagger Docs**: [https://banking-frontend-46vb.onrender.com/docs](https://banking-frontend-46vb.onrender.com/docs)
+- **Frontend Dashboard**: [http://localhost:3000](http://localhost:3000)
+- **Interactive Swagger Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **MLflow UI**: [http://localhost:5001](http://localhost:5001)
 
 ---
 
