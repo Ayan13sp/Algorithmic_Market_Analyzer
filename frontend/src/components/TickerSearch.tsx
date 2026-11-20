@@ -91,7 +91,7 @@ export default function TickerSearch({ onAnalyze, isLoading }: TickerSearchProps
                        outline-none transition-all focus:border-cyan-500/50
                        disabled:opacity-50"
           >
-            {[1, 2, 3, 5, 7, 10].map((y) => (
+            {[2, 3, 5, 7, 10].map((y) => (
               <option key={y} value={y} className="bg-[#0f1729] text-white">
                 {y}Y
               </option>

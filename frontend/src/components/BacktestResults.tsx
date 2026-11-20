@@ -5,6 +5,7 @@ import {
   createChart,
   ColorType,
   LineSeries,
+  LineStyle,
   type IChartApi,
   type LineData,
   type Time,
@@ -15,9 +16,22 @@ interface BacktestResultsProps {
   backtest: BacktestResult;
 }
 
+const formatP = (p?: number | null) => (p == null ? "–" : p < 0.001 ? "<0.001" : p.toFixed(3));
+
+function Stat({ label, value, hint, tone }: { label: string; value: string; hint?: string; tone?: string }) {
+  return (
+    <div className="bg-[var(--surface)] px-4 py-3">
+      <p className="text-[10px] uppercase tracking-wider text-white/40">{label}</p>
+      <p className={`mt-0.5 text-sm font-bold ${tone ?? "text-white"}`}>{value}</p>
+      {hint && <p className="text-[10px] text-white/30">{hint}</p>}
+    </div>
+  );
+}
+
 /**
- * BacktestResults — displays the ML strategy vs Buy-and-Hold comparison
- * with cumulative returns line chart and key portfolio metrics.
+ * BacktestResults — walk-forward, out-of-sample ML strategy vs Buy-and-Hold,
+ * net of transaction costs, with the cumulative-return chart (net and gross)
+ * and the risk / significance statistics.
  */
 export default function BacktestResults({ backtest }: BacktestResultsProps) {
   const chartRef = useRef<HTMLDivElement>(null);
@@ -52,7 +66,7 @@ export default function BacktestResults({ backtest }: BacktestResultsProps) {
 
     chartInstance.current = chart;
 
-    // ML Strategy line.
+    // ML Strategy line (net of costs).
     const mlSeries = chart.addSeries(LineSeries, {
       color: "#06b6d4",
       lineWidth: 2,
@@ -65,6 +79,21 @@ export default function BacktestResults({ backtest }: BacktestResultsProps) {
       value: d.ml_cumulative,
     }));
     mlSeries.setData(mlData);
+
+    // ML Strategy before costs (dashed): the gap is what trading costs take.
+    const grossPoints = backtest.daily_cumulative.filter((d) => d.ml_gross_cumulative != null);
+    if (grossPoints.length > 0) {
+      const grossSeries = chart.addSeries(LineSeries, {
+        color: "rgba(6, 182, 212, 0.45)",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        priceLineVisible: false,
+        lastValueVisible: false,
+      });
+      grossSeries.setData(
+        grossPoints.map((d) => ({ time: d.date as Time, value: d.ml_gross_cumulative as number }))
+      );
+    }
 
     // Buy & Hold line.
     const bhSeries = chart.addSeries(LineSeries, {
@@ -100,12 +129,18 @@ export default function BacktestResults({ backtest }: BacktestResultsProps) {
   const formatCurrency = (val: number) =>
     `₹${val.toLocaleString("en-IN", { minimumFractionDigits: 0 })}`;
 
+  const stats = backtest.strategy_stats;
+  const trades = backtest.trade_stats;
+  const roundTrip = backtest.costs?.round_trip_bps;
+
   return (
     <div className="glass-card overflow-hidden">
       <div className="border-b border-white/5 px-5 py-3">
         <h2 className="text-sm font-semibold text-white">Backtest Results</h2>
         <p className="text-[11px] text-white/40">
-          ML Strategy vs Buy & Hold · Starting Capital: {formatCurrency(backtest.starting_capital)}
+          Walk-forward out-of-sample
+          {roundTrip != null && ` · net of ${roundTrip} bps round-trip costs`} · Starting Capital:{" "}
+          {formatCurrency(backtest.starting_capital)}
         </p>
       </div>
 
@@ -120,6 +155,9 @@ export default function BacktestResults({ backtest }: BacktestResultsProps) {
           </p>
           <p className={`text-xs font-medium ${backtest.ml_return_pct >= 0 ? "text-emerald-400" : "text-red-400"}`}>
             {backtest.ml_return_pct >= 0 ? "+" : ""}{backtest.ml_return_pct}%
+            {backtest.gross_return_pct != null && (
+              <span className="ml-1.5 text-white/30">({backtest.gross_return_pct}% before costs)</span>
+            )}
           </p>
         </div>
         <div className="bg-[var(--surface)] p-4">
@@ -139,7 +177,10 @@ export default function BacktestResults({ backtest }: BacktestResultsProps) {
       <div>
         <div className="flex items-center gap-4 px-5 pt-3 text-[10px]">
           <span className="flex items-center gap-1.5">
-            <span className="h-0.5 w-4 rounded bg-cyan-400" /> ML Strategy
+            <span className="h-0.5 w-4 rounded bg-cyan-400" /> ML Strategy (net)
+          </span>
+          <span className="flex items-center gap-1.5">
+            <span className="w-4 border-t border-dashed border-cyan-400/60" /> Before costs
           </span>
           <span className="flex items-center gap-1.5">
             <span className="h-0.5 w-4 rounded bg-amber-400/70" /> Buy & Hold
@@ -148,16 +189,38 @@ export default function BacktestResults({ backtest }: BacktestResultsProps) {
         <div ref={chartRef} className="w-full" />
       </div>
 
-      {/* Sharpe Ratio footer */}
-      <div className="border-t border-white/5 px-5 py-3 flex items-center justify-between">
-        <span className="text-xs text-white/40">Annualised Sharpe Ratio</span>
-        <span
-          className={`text-sm font-bold ${
-            backtest.sharpe_ratio > 0 ? "text-emerald-400" : "text-red-400"
-          }`}
-        >
-          {backtest.sharpe_ratio.toFixed(4)}
-        </span>
+      {/* Risk and significance statistics */}
+      <div className="grid grid-cols-2 gap-px border-t border-white/5 bg-white/5 sm:grid-cols-3">
+        <Stat
+          label="Net Sharpe"
+          value={backtest.sharpe_ratio.toFixed(2)}
+          hint={stats ? `95% CI [${stats.sharpe_ci_low.toFixed(2)}, ${stats.sharpe_ci_high.toFixed(2)}]` : undefined}
+          tone={backtest.sharpe_ratio > 0 ? "text-emerald-400" : "text-red-400"}
+        />
+        <Stat
+          label="Gross Sharpe"
+          value={backtest.gross_sharpe_ratio != null ? backtest.gross_sharpe_ratio.toFixed(2) : "–"}
+          hint="before costs"
+        />
+        <Stat
+          label="Max drawdown"
+          value={stats ? `${stats.max_drawdown_pct.toFixed(1)}%` : "–"}
+        />
+        <Stat
+          label="Trades / year"
+          value={trades ? trades.trades_per_year.toFixed(0) : "–"}
+          hint={trades ? `in market ${trades.exposure_pct.toFixed(0)}% of days` : undefined}
+        />
+        <Stat
+          label="Gross edge / trade"
+          value={trades?.avg_gross_edge_bps != null ? `${trades.avg_gross_edge_bps.toFixed(1)} bps` : "–"}
+          hint="break-even cost"
+        />
+        <Stat
+          label="Permutation p"
+          value={formatP(backtest.permutation_p_value)}
+          hint="vs random timing"
+        />
       </div>
     </div>
   );
