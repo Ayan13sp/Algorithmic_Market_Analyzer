@@ -10,6 +10,7 @@ from app.ml_engine import (  # noqa: E402
     FEATURE_COLS,
     FEATURE_GROUPS,
     engineer_features,
+    labelled_rows,
     run_backtest,
     train_and_predict,
 )
@@ -63,9 +64,19 @@ def test_training_logs_parent_and_candidate_runs(mlflow_store, engineered_df):
     assert run.info.status == "FINISHED"
     assert run.data.params["n_features"] == str(len(FEATURE_COLS))
     assert run.data.tags["best_model"] == results["best_model_name"]
-    assert run.data.metrics["test_accuracy"] == pytest.approx(results["metrics"]["accuracy"])
-    for key in ("baseline_majority_accuracy", "backtest_sharpe_ratio", "accuracy_lift_over_baseline"):
+    assert run.data.params["validation"] == "walk_forward"
+    assert int(run.data.params["wf_n_folds"]) == len(results["validation"]["folds"])
+    assert run.data.metrics["oos_accuracy"] == pytest.approx(results["metrics"]["accuracy"], abs=1e-4)
+    assert run.data.metrics["oos_balanced_accuracy"] == pytest.approx(
+        results["metrics"]["balanced_accuracy"], abs=1e-4
+    )
+    for key in ("baseline_majority_accuracy", "backtest_sharpe_ratio", "accuracy_lift_over_baseline",
+                "p_value_vs_baseline", "backtest_gross_sharpe_ratio", "backtest_max_drawdown_pct"):
         assert key in run.data.metrics
+
+    # Per-fold metrics are logged as a series (one step per fold).
+    history = mlflow_store.get_metric_history(tracker.run_id, "fold_balanced_accuracy")
+    assert [m.step for m in history] == [f["fold"] for f in results["validation"]["folds"]]
 
     # Train/test datasets are recorded as run inputs.
     contexts = {
@@ -77,13 +88,13 @@ def test_training_logs_parent_and_candidate_runs(mlflow_store, engineered_df):
     assert contexts == {"training", "testing"}
 
     artifacts = {a.path for a in mlflow_store.list_artifacts(tracker.run_id)}
-    assert {"feature_importances.json", "model_comparison.json", "plots"} <= artifacts
+    assert {"feature_importances.json", "model_comparison.json", "walk_forward_folds.csv", "plots"} <= artifacts
 
     # One nested run per candidate, exactly one flagged as best.
     children = _child_runs(mlflow_store, tracker.run_id)
     assert {c.info.run_name for c in children} == {"Logistic Regression", "Random Forest", "SVM"}
     assert [c.data.tags["is_best"] for c in children].count("true") == 1
-    assert all("cv_accuracy_mean" in c.data.metrics for c in children)
+    assert all({"cv_score_mean", "oos_balanced_accuracy"} <= set(c.data.metrics) for c in children)
 
     # The selected model is logged, loadable, and registered.
     model_uri = f"models:/{tracking._registered_model_name(TICKER)}/1"
@@ -126,7 +137,8 @@ def test_every_model_family_can_be_logged_and_reloaded(mlflow_store, engineered_
     """Regression: skops rejected RandomForest trees, silently skipping the artifact."""
     from app.ml_engine import build_models
 
-    X, y = engineered_df[FEATURE_COLS], engineered_df["target"]
+    labelled = labelled_rows(engineered_df)
+    X, y = labelled[FEATURE_COLS], labelled["target"]
     model = build_models()[family].fit(X, y)
     with tracking.start_run(f"log-{family}") as tracker:
         tracker.log_model(model, X, ticker=TICKER, model_name=family)

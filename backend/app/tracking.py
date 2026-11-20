@@ -4,15 +4,19 @@ Experiment Tracking (MLflow)
 Records every training run so experiments are reproducible and comparable:
 
     Parent run  (one per analysis / experiment config)
-    ├── params     ticker, feature list, feature-set version, split dates, CV setup
-    ├── inputs     train / test datasets (MLflow dataset digests + schema)
-    ├── metrics    test accuracy / precision / recall, majority-class baseline,
-    │              backtest return, Sharpe ratio
-    ├── artifacts  feature importances (json + png), model comparison,
-    │              equity curve, the selected sklearn Pipeline (+ signature)
-    └── child runs (one per candidate model)
+    ├── params     ticker, feature list, feature-set version, walk-forward setup,
+    │              out-of-sample date range, transaction-cost assumptions
+    ├── inputs     training / out-of-sample datasets (MLflow dataset digests)
+    ├── metrics    OOS accuracy / balanced accuracy / ROC AUC, majority-class
+    │              baseline, per-fold metric series (step = fold), net and
+    │              gross backtest return, Sharpe, drawdown, drift statistics
+    ├── tags       best_model, drift_status
+    ├── artifacts  walk-forward fold table, feature importances (json + png),
+    │              model comparison, equity curve, drift report, and the
+    │              production sklearn Pipeline (+ signature)
+    └── child runs (one per candidate model at the latest tuning)
         ├── params     search space + best hyperparameters
-        ├── metrics    CV accuracy mean/std, fit time, test metrics
+        ├── metrics    CV score mean/std, fit time, out-of-sample metrics
         └── artifacts  full RandomizedSearchCV cv_results_ table
 
 Design rules
@@ -31,8 +35,8 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -116,8 +120,11 @@ class ExperimentTracker:
         mlflow.log_params(params)
 
     @_safe
-    def log_metrics(self, metrics: Dict[str, float]) -> None:
-        mlflow.log_metrics({k: float(v) for k, v in metrics.items()})
+    def log_metrics(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
+        """Log numeric metrics, skipping missing values (e.g. an undefined AUC)."""
+        clean = {k: float(v) for k, v in metrics.items() if v is not None and math.isfinite(float(v))}
+        if clean:
+            mlflow.log_metrics(clean, step=step)
 
     @_safe
     def set_tags(self, tags: Dict[str, Any]) -> None:
@@ -151,9 +158,10 @@ class ExperimentTracker:
 
         names = [d["feature"] for d in importances][::-1]
         values = [d["importance"] for d in importances][::-1]
+        errors = [d.get("std", 0.0) for d in importances][::-1]
         fig, ax = plt.subplots(figsize=(7, 0.35 * len(names) + 1.2))
-        ax.barh(names, values, color="#4C78A8")
-        ax.set_xlabel("Mean decrease in impurity (Random Forest)")
+        ax.barh(names, values, xerr=errors, color="#4C78A8", ecolor="#9E9E9E")
+        ax.set_xlabel("Mean decrease in impurity (Random Forest, mean ± sd across folds)")
         ax.set_title("Feature importances")
         fig.tight_layout()
         mlflow.log_figure(fig, "plots/feature_importances.png")
@@ -188,10 +196,10 @@ class ExperimentTracker:
                 "search_space.json",
             )
             mlflow.log_metrics({
-                "cv_accuracy_mean": float(search.best_score_),
-                "cv_accuracy_std": float(cv["std_test_score"][best]),
+                "cv_score_mean": float(search.best_score_),
+                "cv_score_std": float(cv["std_test_score"][best]),
                 "mean_fit_time_s": float(cv["mean_fit_time"][best]),
-                **{f"test_{k}": float(v) for k, v in test_metrics.items()},
+                **{f"oos_{k}": float(v) for k, v in test_metrics.items() if v is not None},
             })
             mlflow.log_text(
                 pd.DataFrame(cv).drop(columns="params").to_csv(index=False),
@@ -223,14 +231,49 @@ class ExperimentTracker:
             tags={"model_family": model_name},
         )
 
+    # ── Walk-forward folds ───────────────────────────────────────────────
+    @_safe
+    def log_walk_forward(self, folds: List[Dict[str, Any]]) -> None:
+        """Fold table as an artifact, plus per-fold metric series (charts in the UI)."""
+        mlflow.log_text(pd.DataFrame(folds).to_csv(index=False), "walk_forward_folds.csv")
+        for fold in folds:
+            self.log_metrics(
+                {f"fold_{k}": fold[k] for k in ("accuracy", "balanced_accuracy", "roc_auc", "positive_rate")},
+                step=fold["fold"],
+            )
+
+    # ── Drift ────────────────────────────────────────────────────────────
+    @_safe
+    def log_drift(self, report: Dict[str, Any]) -> None:
+        mlflow.set_tag("drift_status", report["status"])
+        vol = report.get("volatility") or {}
+        self.log_metrics({
+            "drift_share_features": report.get("share_drifted"),
+            "drift_volatility_percentile": vol.get("percentile"),
+            "drift_volatility_ratio": vol.get("ratio"),
+        })
+        mlflow.log_dict(report, "drift_report.json")
+
     # ── Backtest ─────────────────────────────────────────────────────────
     @_safe
     def log_backtest(self, backtest: Dict[str, Any]) -> None:
-        mlflow.log_metrics({
+        stats = backtest.get("strategy_stats") or {}
+        trades = backtest.get("trade_stats") or {}
+        self.log_metrics({
             "backtest_ml_return_pct": backtest["ml_return_pct"],
             "backtest_bh_return_pct": backtest["bh_return_pct"],
             "backtest_excess_return_pct": backtest["ml_return_pct"] - backtest["bh_return_pct"],
             "backtest_sharpe_ratio": backtest["sharpe_ratio"],
+            "backtest_gross_return_pct": backtest.get("gross_return_pct"),
+            "backtest_gross_sharpe_ratio": backtest.get("gross_sharpe_ratio"),
+            "backtest_cost_drag_pct": backtest.get("cost_drag_pct"),
+            "backtest_max_drawdown_pct": stats.get("max_drawdown_pct"),
+            "backtest_sortino_ratio": stats.get("sortino_ratio"),
+            "backtest_n_trades": trades.get("n_trades"),
+            "backtest_exposure_pct": trades.get("exposure_pct"),
+            "backtest_avg_gross_edge_bps": trades.get("avg_gross_edge_bps"),
+            "backtest_permutation_p_value": backtest.get("permutation_p_value"),
+            "round_trip_cost_bps": (backtest.get("costs") or {}).get("round_trip_bps"),
         })
 
         import matplotlib
@@ -240,7 +283,9 @@ class ExperimentTracker:
         curve = pd.DataFrame(backtest["daily_cumulative"])
         curve["date"] = pd.to_datetime(curve["date"])
         fig, ax = plt.subplots(figsize=(9, 4))
-        ax.plot(curve["date"], curve["ml_cumulative"], label="ML strategy")
+        ax.plot(curve["date"], curve["ml_cumulative"], label="ML strategy (net of costs)")
+        if "ml_gross_cumulative" in curve:
+            ax.plot(curve["date"], curve["ml_gross_cumulative"], "--", alpha=0.6, label="ML strategy (gross)")
         ax.plot(curve["date"], curve["bh_cumulative"], label="Buy & hold")
         ax.set_ylabel("Growth of 1 unit")
         ax.set_title("Out-of-sample equity curve")
