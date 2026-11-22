@@ -1,6 +1,6 @@
 """Startup helper — run from the project root: python3 backend/run.py"""
-import sys
 import os
+import sys
 
 # Ensure the backend directory is on the import path.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))

@@ -1,12 +1,69 @@
-name: CI
+name: CI/CD
 
+# Every push to any branch: lint → unit/integration tests (+ coverage gate) →
+# backtest sanity checks → frontend checks → Docker build + full-stack smoke
+# test. Pushes to main also publish the images to GitHub Container Registry.
 on:
   push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  backend:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff==0.17.6
+      - run: ruff check --output-format=github .
+
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Unit, property-based and API tests with coverage
+        run: pytest --cov --cov-report=term --cov-report=xml --cov-fail-under=90 --junitxml=junit.xml
+      - name: Coverage summary
+        if: always() && matrix.python-version == '3.11'
+        run: |
+          echo "## Test coverage" >> "$GITHUB_STEP_SUMMARY"
+          python -m coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.python-version == '3.11'
+        with:
+          name: test-reports
+          path: |
+            backend/coverage.xml
+            backend/junit.xml
+
+  backtest-sanity:
+    name: Backtest sanity check
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -18,10 +75,12 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: backend/requirements*.txt
-      - run: pip install -r requirements.txt -r requirements-dev.txt
-      - run: pytest -q
+      - run: pip install -r requirements.txt
+      - name: Known-answer scenarios on synthetic markets
+        run: python -m experiments.backtest_sanity --summary "$GITHUB_STEP_SUMMARY"
 
   frontend:
+    name: Frontend (lint, types, build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -37,3 +96,68 @@ jobs:
       - run: npm run lint
       - run: npx tsc --noEmit
       - run: npm run build
+
+  docker:
+    name: Docker build & smoke test
+    needs: [lint, test, backtest-sanity, frontend]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      BACKEND_IMAGE: algorithmic-market-analyzer-backend:ci
+      FRONTEND_IMAGE: algorithmic-market-analyzer-frontend:ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: backend
+          file: backend/Dockerfile.backend
+          tags: ${{ env.BACKEND_IMAGE }}
+          load: true
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          file: frontend/Dockerfile.frontend
+          build-args: NEXT_PUBLIC_API_URL=http://localhost:8000
+          tags: ${{ env.FRONTEND_IMAGE }}
+          load: true
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+      - name: Start the full stack (Postgres, MLflow, API, dashboard)
+        run: docker compose up --detach --no-build --wait --wait-timeout 240
+      - name: Smoke test
+        run: |
+          curl -fsS http://localhost:8000/api/health
+          curl -fsS -o /dev/null http://localhost:8000/docs
+          curl -fsS -o /dev/null http://localhost:3000
+          curl -fsS http://localhost:5001/health
+      - name: Container logs
+        if: failure()
+        run: docker compose logs
+      - name: Stop the stack
+        if: always()
+        run: docker compose down --volumes
+      - name: Log in to GitHub Container Registry
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish images
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          for service in backend frontend; do
+            for tag in latest "sha-${GITHUB_SHA::7}"; do
+              target="ghcr.io/${owner}/algorithmic-market-analyzer-${service}:${tag}"
+              docker tag "algorithmic-market-analyzer-${service}:ci" "${target}"
+              docker push "${target}"
+            done
+          done

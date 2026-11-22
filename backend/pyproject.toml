@@ -1,0 +1,23 @@
+# Tool configuration for the backend (pytest settings live in pytest.ini).
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = [".venv", "mlruns"]
+
+[tool.ruff.lint]
+# pycodestyle errors/warnings, pyflakes, import sorting, bugbear.
+select = ["E", "W", "F", "I", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection defaults are evaluated per request.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query"]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_also = ["if __name__ == .__main__.:", "pragma: no cover"]
