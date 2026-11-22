@@ -11,11 +11,13 @@ import pytest
 
 from app.ml_engine import (
     FEATURE_COLS,
+    INDICATOR_COLS,
     build_models,
     compute_ema,
     compute_rsi,
     compute_sma,
     engineer_features,
+    labelled_rows,
     prepare_train_test_split,
     run_backtest,
     validate_training_data,
@@ -24,8 +26,8 @@ from app.ml_engine import (
 
 @pytest.fixture
 def engineered_df(ohlcv) -> pd.DataFrame:
-    """Fully engineered DataFrame ready for model training."""
-    return engineer_features(ohlcv.copy())
+    """Fully engineered, labelled DataFrame ready for model training."""
+    return labelled_rows(engineer_features(ohlcv.copy()))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -49,11 +51,20 @@ def test_rsi_is_bounded(ohlcv):
     assert rsi.between(0, 100).all()
 
 
-def test_engineer_features_outputs_all_columns_and_no_nans(ohlcv):
+def test_engineer_features_outputs_all_columns_and_no_feature_nans(ohlcv):
     out = engineer_features(ohlcv.copy())
-    assert set(FEATURE_COLS).issubset(out.columns)
-    assert not out[FEATURE_COLS + ["target"]].isna().any().any()
-    assert set(out["target"].unique()) <= {0, 1}
+    assert set(FEATURE_COLS + INDICATOR_COLS).issubset(out.columns)
+    assert not out[FEATURE_COLS + INDICATOR_COLS].isna().any().any()
+    assert set(out["target"].iloc[:-1].unique()) <= {0, 1}
+
+
+def test_latest_row_target_is_unknown_not_zero(ohlcv):
+    """Regression: the last row has no next session, so its label must be NaN
+    (it used to be silently set to 0 and leak into training/evaluation)."""
+    out = engineer_features(ohlcv.copy())
+    assert np.isnan(out["target"].iloc[-1])
+    assert out.index[-1] == ohlcv.index[-1]  # still kept, for live inference
+    assert len(labelled_rows(out)) == len(out) - 1
 
 
 def test_target_is_next_day_intraday_direction(ohlcv):
@@ -166,7 +177,7 @@ class TestValidateTrainingData:
 
     def test_rejects_nan_in_features(self, engineered_df):
         df = engineered_df.copy()
-        df.iloc[0, df.columns.get_loc("sma_14")] = np.nan
+        df.iloc[0, df.columns.get_loc(FEATURE_COLS[0])] = np.nan
         with pytest.raises(ValueError, match="NaN"):
             validate_training_data(df)
 

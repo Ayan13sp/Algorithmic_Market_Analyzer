@@ -12,6 +12,12 @@ def _tracking_disabled_by_default(monkeypatch):
     monkeypatch.setattr(settings, "MLFLOW_ENABLED", False)
 
 
+@pytest.fixture(autouse=True)
+def _single_process_tuning(monkeypatch):
+    """Tiny datasets tune faster without spawning joblib worker processes."""
+    monkeypatch.setattr(settings, "ML_N_JOBS", 1)
+
+
 @pytest.fixture
 def ohlcv() -> pd.DataFrame:
     rng = np.random.default_rng(0)

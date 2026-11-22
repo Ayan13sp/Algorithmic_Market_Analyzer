@@ -46,24 +46,64 @@ export interface PredictionDetail {
 export interface FeatureImportance {
   feature: string;
   importance: number;
+  std?: number | null;
 }
 
 export interface ClassificationMetrics {
   accuracy: number;
   precision: number;
   recall: number;
+  balanced_accuracy?: number | null;
+  roc_auc?: number | null;
+  baseline_accuracy?: number | null;
+  p_value_vs_baseline?: number | null;
 }
 
 export interface ModelMetrics {
   accuracy: number;
   precision: number;
   recall: number;
+  balanced_accuracy?: number | null;
+  roc_auc?: number | null;
 }
 
 export interface DailyCumulative {
   date: string;
   ml_cumulative: number;
   bh_cumulative: number;
+  ml_gross_cumulative?: number | null;
+}
+
+export interface CostAssumptions {
+  commission_bps: number;
+  slippage_bps: number;
+  sell_tax_bps: number;
+  buy_tax_bps: number;
+  round_trip_bps?: number | null;
+}
+
+export interface PerformanceStats {
+  total_return_pct: number;
+  cagr_pct: number;
+  volatility_pct: number;
+  sharpe_ratio: number;
+  sharpe_ci_low: number;
+  sharpe_ci_high: number;
+  sortino_ratio: number;
+  max_drawdown_pct: number;
+  calmar_ratio: number;
+  n_days: number;
+}
+
+export interface TradeStats {
+  n_trades: number;
+  exposure_pct: number;
+  trades_per_year: number;
+  hit_rate?: number | null;
+  gross_hit_rate?: number | null;
+  avg_gross_edge_bps?: number | null;
+  avg_net_trade_bps?: number | null;
+  profit_factor?: number | null;
 }
 
 export interface BacktestResult {
@@ -74,6 +114,88 @@ export interface BacktestResult {
   bh_return_pct: number;
   sharpe_ratio: number;
   daily_cumulative: DailyCumulative[];
+  gross_return_pct?: number | null;
+  gross_sharpe_ratio?: number | null;
+  cost_drag_pct?: number | null;
+  costs?: CostAssumptions | null;
+  strategy_stats?: PerformanceStats | null;
+  buy_hold_stats?: PerformanceStats | null;
+  always_long_stats?: PerformanceStats | null;
+  trade_stats?: TradeStats | null;
+  permutation_p_value?: number | null;
+  cost_sensitivity?: { round_trip_bps: number; net_return_pct: number; sharpe_ratio: number }[];
+}
+
+export interface FoldSummary {
+  fold: number;
+  train_start: string;
+  train_end: string;
+  test_start: string;
+  test_end: string;
+  n_train: number;
+  n_test: number;
+  model: string;
+  retuned: boolean;
+  cv_score?: number | null;
+  accuracy?: number | null;
+  balanced_accuracy?: number | null;
+  roc_auc?: number | null;
+  positive_rate?: number | null;
+}
+
+export interface ValidationSummary {
+  method: string;
+  window: string;
+  n_folds: number;
+  initial_train_size: number;
+  step: number;
+  retune_every: number;
+  gap: number;
+  selection_metric: string;
+  oos_start: string;
+  oos_end: string;
+  n_oos: number;
+  model_selection_counts: Record<string, number>;
+  folds: FoldSummary[];
+}
+
+export interface FeatureDrift {
+  feature: string;
+  psi: number;
+  psi_p_value?: number | null;
+  ks_statistic: number;
+  ks_p_value: number;
+  drifted: boolean;
+}
+
+export interface DriftReport {
+  status: "ok" | "warning" | "drift" | "insufficient_data";
+  alerts: string[];
+  reference_start?: string | null;
+  reference_end?: string | null;
+  current_start?: string | null;
+  current_end?: string | null;
+  n_reference?: number | null;
+  n_current?: number | null;
+  share_drifted?: number | null;
+  drifted_features: string[];
+  features: FeatureDrift[];
+  volatility?: {
+    current_vol_pct: number;
+    reference_vol_pct: number;
+    ratio?: number | null;
+    percentile: number;
+    levene_p_value?: number | null;
+    regime: "low" | "normal" | "high";
+  } | null;
+  concept?: {
+    status: "stable" | "degraded" | "insufficient_data";
+    window: number;
+    n_oos: number;
+    recent_error_rate?: number | null;
+    reference_error_rate?: number | null;
+    error_p_value?: number | null;
+  } | null;
 }
 
 export interface AnalysisResponse {
@@ -90,6 +212,9 @@ export interface AnalysisResponse {
   backtest: BacktestResult;
   best_model: string;
   all_model_metrics: Record<string, ModelMetrics>;
+  validation?: ValidationSummary | null;
+  drift?: DriftReport | null;
+  mlflow_run_id?: string | null;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

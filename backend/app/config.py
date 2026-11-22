@@ -50,6 +50,14 @@ class Settings(BaseSettings):
     # "market-direction-<TICKER>" in the MLflow Model Registry.
     MLFLOW_REGISTER_MODELS: bool = True
 
+    # ── Walk-forward validation ───────────────────────────────────────────
+    # Defaults keep /api/analyze responsive on a small instance; the offline
+    # evaluation (experiments/evaluate.py) re-tunes at every fold.
+    WF_INITIAL_TRAIN_DAYS: int = 504   # ~2 trading years before the first OOS day
+    WF_STEP_DAYS: int = 63             # refit and predict one quarter at a time
+    WF_RETUNE_EVERY: int = 4           # re-run the hyperparameter search every N folds (~yearly)
+    ML_N_JOBS: int = -1                # joblib workers for tuning (-1 = all cores)
+
     @property
     def all_cors_origins(self) -> List[str]:
         """Combine static and dynamic CORS origins."""

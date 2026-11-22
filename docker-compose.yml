@@ -49,12 +49,20 @@ services:
       - "5001:5000"   # host 5001: macOS AirPlay Receiver already owns :5000
     volumes:
       - mlflowdata:/mlflow
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
 
   # ── FastAPI Backend ──────────────────────────────────────────────────
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile.backend
+    # CI builds and loads this image once, then runs `docker compose up --no-build`.
+    image: ${BACKEND_IMAGE:-algorithmic-market-analyzer-backend:local}
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -69,7 +77,13 @@ services:
       db:
         condition: service_healthy
       mlflow:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
 
   # ── Next.js Frontend ────────────────────────────────────────────────
   frontend:
@@ -78,13 +92,23 @@ services:
       dockerfile: Dockerfile.frontend
       args:
         NEXT_PUBLIC_API_URL: http://localhost:8000
+    image: ${FRONTEND_IMAGE:-algorithmic-market-analyzer-frontend:local}
     restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000
+      # Next.js standalone binds to $HOSTNAME, which Docker sets to the container ID.
+      HOSTNAME: 0.0.0.0
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000 > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
 
 volumes:
   pgdata:

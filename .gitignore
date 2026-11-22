@@ -60,3 +60,11 @@ backend/__pycache__/
 # MLflow
 mlruns/
 mlartifacts/
+
+# Test & coverage artifacts
+.coverage
+coverage.xml
+junit.xml
+htmlcov/
+.hypothesis/
+.ruff_cache/

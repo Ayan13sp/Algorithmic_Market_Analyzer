@@ -42,11 +42,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Algorithmic Market Analyzer",
     description=(
-        "A quantitative analysis API that fetches OHLCV data, engineers "
-        "statistical features, trains a Random Forest classifier, and "
-        "backtests trading strategies."
+        "A quantitative analysis API that fetches NSE/BSE OHLCV data, engineers "
+        "16 technical features, validates three classifiers with walk-forward "
+        "(nested time-series) cross-validation, backtests the out-of-sample "
+        "signals net of realistic transaction costs, and monitors data, "
+        "volatility and concept drift."
     ),
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 

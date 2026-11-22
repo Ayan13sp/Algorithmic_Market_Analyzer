@@ -34,9 +34,9 @@ from app.ml_engine import (
     FEATURE_COLS,
     FEATURE_GROUPS,
     FEATURE_SET_VERSION,
+    backtest_signals,
     download_ohlcv,
     engineer_features,
-    run_backtest,
     train_and_predict,
 )
 
@@ -77,7 +77,8 @@ def run_study(tickers: List[str], years: int, capital: float, include_single: bo
             ) as tracker:
                 tracker.log_params({"lookback_years": years, "starting_capital": capital})
                 res = train_and_predict(df, ticker, db=None, feature_cols=cols, tracker=tracker)
-                bt = run_backtest(res["test_df"], res["y_pred"], capital)
+                signals = res["signals"]
+                bt = backtest_signals(df.loc[signals.index], signals, capital)
                 tracker.log_backtest(bt)
 
             rows.append({
@@ -85,18 +86,19 @@ def run_study(tickers: List[str], years: int, capital: float, include_single: bo
                 "feature_set": set_name,
                 "n_features": len(cols),
                 "best_model": res["best_model_name"],
-                "test_accuracy": round(res["metrics"]["accuracy"], 4),
-                "sharpe": bt["sharpe_ratio"],
+                "balanced_accuracy": res["metrics"]["balanced_accuracy"],
+                "roc_auc": res["metrics"]["roc_auc"],
+                "net_sharpe": bt["sharpe_ratio"],
                 "ml_return_pct": bt["ml_return_pct"],
                 "bh_return_pct": bt["bh_return_pct"],
                 "mlflow_run_id": tracker.run_id,
             })
 
     summary = pd.DataFrame(rows)
-    # Accuracy change vs. the all-features reference for the same ticker:
-    # a large drop when a family is removed means that family carries signal.
-    ref = summary[summary.feature_set == "all"].set_index("ticker")["test_accuracy"]
-    summary["delta_acc_vs_all"] = (summary["test_accuracy"] - summary["ticker"].map(ref)).round(4)
+    # Out-of-sample balanced-accuracy change vs. the all-features reference for
+    # the same ticker: a large drop when a family is removed means it carries signal.
+    ref = summary[summary.feature_set == "all"].set_index("ticker")["balanced_accuracy"]
+    summary["delta_bal_acc_vs_all"] = (summary["balanced_accuracy"] - summary["ticker"].map(ref)).round(4)
 
     with tracking.start_run(
         run_name="ablation-summary",

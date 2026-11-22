@@ -11,8 +11,12 @@ import PredictionCard from "@/components/PredictionCard";
 import BacktestResults from "@/components/BacktestResults";
 import FeatureImportance from "@/components/FeatureImportance";
 import StatCard from "@/components/StatCard";
+import DriftCard from "@/components/DriftCard";
 
 type BackendStatus = "connected" | "disconnected" | "checking";
+
+const formatPct = (v?: number | null) => (v == null ? "–" : `${(v * 100).toFixed(1)}%`);
+const formatP = (p?: number | null) => (p == null ? "–" : p < 0.001 ? "<0.001" : p.toFixed(3));
 
 /**
  * Dashboard Page — the main entry point.
@@ -56,6 +60,9 @@ export default function DashboardPage() {
       setIsLoading(false);
     }
   }, []);
+
+  // Out-of-sample skill is "significant" only if it beats the baseline (McNemar p < 0.05).
+  const significant = (data?.metrics.p_value_vs_baseline ?? 1) < 0.05;
 
   return (
     <>
@@ -118,8 +125,8 @@ export default function DashboardPage() {
                   <StatCard
                     label="Accuracy"
                     value={`${(data.metrics.accuracy * 100).toFixed(1)}%`}
-                    subtitle="Test set"
-                    sentiment={data.metrics.accuracy > 0.5 ? "positive" : "neutral"}
+                    subtitle={`Baseline ${formatPct(data.metrics.baseline_accuracy)}`}
+                    sentiment={significant ? "positive" : "neutral"}
                     icon={
                       <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
@@ -128,10 +135,10 @@ export default function DashboardPage() {
                     }
                   />
                   <StatCard
-                    label="Precision"
-                    value={`${(data.metrics.precision * 100).toFixed(1)}%`}
-                    subtitle="Buy signal"
-                    sentiment={data.metrics.precision > 0.5 ? "positive" : "neutral"}
+                    label="Balanced Acc."
+                    value={formatPct(data.metrics.balanced_accuracy)}
+                    subtitle="Out-of-sample · chance 50%"
+                    sentiment={significant ? "positive" : "neutral"}
                     icon={
                       <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
@@ -140,10 +147,10 @@ export default function DashboardPage() {
                     }
                   />
                   <StatCard
-                    label="Recall"
-                    value={`${(data.metrics.recall * 100).toFixed(1)}%`}
-                    subtitle="Coverage"
-                    sentiment={data.metrics.recall > 0.5 ? "positive" : "neutral"}
+                    label="ROC AUC"
+                    value={data.metrics.roc_auc != null ? data.metrics.roc_auc.toFixed(3) : "–"}
+                    subtitle={`vs baseline: p = ${formatP(data.metrics.p_value_vs_baseline)}`}
+                    sentiment={significant ? "positive" : "neutral"}
                     icon={
                       <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
@@ -166,10 +173,10 @@ export default function DashboardPage() {
                   />
                 </div>
 
-                {/* Train / Test split info */}
+                {/* Walk-forward validation info */}
                 <div className="glass-card p-4">
                   <p className="text-[10px] font-semibold uppercase tracking-wider text-white/40 mb-2">
-                    Time-Series Split
+                    Walk-Forward Validation
                   </p>
                   <div className="flex gap-1 h-3 rounded-full overflow-hidden bg-white/5">
                     <div
@@ -182,10 +189,18 @@ export default function DashboardPage() {
                     />
                   </div>
                   <div className="mt-2 flex justify-between text-[10px] text-white/40">
-                    <span>Train: {data.train_size} rows (80%)</span>
-                    <span>Test: {data.test_size} rows (20%)</span>
+                    <span>First training window: {data.train_size} rows</span>
+                    <span>Out-of-sample: {data.test_size} rows</span>
                   </div>
+                  {data.validation && (
+                    <p className="mt-2 text-[10px] leading-relaxed text-white/30">
+                      {data.validation.n_folds} folds · refit every {data.validation.step} days on all prior
+                      data · model re-selected by cross-validated balanced accuracy (latest: {data.best_model})
+                    </p>
+                  )}
                 </div>
+
+                {data.drift && <DriftCard drift={data.drift} />}
               </>
             )}
 
@@ -202,7 +217,8 @@ export default function DashboardPage() {
                   Enter a ticker to begin
                 </p>
                 <p className="mt-1 text-xs text-white/30">
-                  The ML pipeline will fetch data, train a model, and backtest the strategy.
+                  The pipeline fetches data, walk-forward validates three models, backtests the
+                  out-of-sample signals net of costs, and checks for drift.
                 </p>
               </div>
             )}

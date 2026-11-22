@@ -1,0 +1,36 @@
+name: Drift monitor
+
+# Weekly check that each stock's latest quarter still looks like the regime
+# the models were trained on (feature drift + volatility regime). A drift
+# alert fails the run, which notifies the repository owner.
+on:
+  schedule:
+    - cron: "30 3 * * 1"  # Mondays 03:30 UTC (09:00 IST), before the NSE opens
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: Space-separated Yahoo Finance tickers
+        default: RELIANCE.NS TCS.NS INFY.NS HDFCBANK.NS ICICIBANK.NS
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    name: Check for drift
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+      - run: pip install -r requirements.txt
+      - name: Run drift monitor
+        env:
+          TICKERS: ${{ inputs.tickers || 'RELIANCE.NS TCS.NS INFY.NS HDFCBANK.NS ICICIBANK.NS' }}
+        run: python -m experiments.monitor_drift --tickers $TICKERS --summary "$GITHUB_STEP_SUMMARY" --fail-on-drift
